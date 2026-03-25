@@ -1,0 +1,49 @@
+# Claude Email Daemon Configuration
+
+# --- Polling ---
+poll_interval_seconds: 300  # 5 minutes
+
+# --- Claude's email (IMAP/SMTP) ---
+claude_email:
+  address: claude@mike-wolf.com
+  imap_server: imap.gmail.com
+  smtp_server: smtp.gmail.com
+  smtp_port: 587
+  # App password read from ~/Projects/memory/context/email.md
+  # Or set CLAUDE_EMAIL_PW environment variable
+
+# --- Mike's AI email (IMAP for draft checking) ---
+# This is a dedicated account for Claude Web/Mobile to leave draft instructions
+mike_email:
+  address: mikeai@mike-wolf.com
+  imap_server: imap.gmail.com
+  # App password read from ~/Projects/memory/context/email.md
+  # Or set MIKE_EMAIL_PW environment variable
+
+# --- LLM ---
+llm:
+  endpoint: http://localhost:11434/api/generate
+  model: qwen2.5:7b
+  temperature: 0.1
+  max_tokens: 200
+
+# --- Draft protocol ---
+# Drafts in Mike's Gmail with this subject prefix are treated as
+# instructions from Claude Web/Mobile
+draft_prefix: "[CLAUDE]"
+
+# --- Forwarding ---
+forward_to: mw@mike-wolf.com
+
+# --- Logging ---
+log_dir: ~/Projects/claude-email-daemon/logs
+state_file: ~/Projects/claude-email-daemon/state/processed.json
+
+# --- Action policies ---
+# Override LLM decisions for specific senders/patterns
+policies:
+  always_forward:
+    - "@mike-wolf.com"
+  always_ignore:
+    - "noreply@marketing"
+    - "no-reply@notifications"
