@@ -47,3 +47,23 @@ policies:
   always_ignore:
     - "noreply@marketing"
     - "no-reply@notifications"
+
+# --- Dispatch routing ---
+# Emails with subject [DISPATCH:Mac|VPS|Hermes] are routed directly to execution
+# backends, bypassing the LLM router entirely.
+dispatch:
+  enabled: true
+  allowed_senders:
+    - mw@mike-wolf.com
+    - mike@embeddedsystemsresearch.org
+    - claude@mike-wolf.com
+  rate_limit_per_hour: 5
+  body_max_bytes: 51200
+  platforms:
+    Mac:
+      command: ~/.local/bin/cc-dispatch
+    VPS:
+      ssh_target: dev@vpsmikewolf.duckdns.org
+      command: ~/.local/bin/cc-dispatch
+    Hermes:
+      enabled: false  # not yet installed on VPS

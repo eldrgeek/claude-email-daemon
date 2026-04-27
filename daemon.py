@@ -17,6 +17,9 @@ import smtplib
 import email
 import json
 import os
+import re
+import shlex
+import subprocess
 import sys
 import time
 import yaml
@@ -51,7 +54,14 @@ def get_password(label, env_var, memory_section=None):
     pw = os.environ.get(env_var)
     if pw:
         return pw
-    memory_path = os.path.expanduser("~/Projects/memory/context/email.md")
+    # Check new canonical path first, fall back to old retired path
+    for candidate in [
+        "~/Projects/second-brain/Resources/email-config.md",
+        "~/Projects/memory/context/email.md",
+    ]:
+        memory_path = os.path.expanduser(candidate)
+        if os.path.exists(memory_path):
+            break
     if memory_section and os.path.exists(memory_path):
         with open(memory_path) as f:
             lines = f.readlines()
@@ -66,6 +76,241 @@ def get_password(label, env_var, memory_section=None):
                 pw = pw.replace("**", "").strip("`").strip()
                 return pw
     raise RuntimeError(f"No password for {label}. Set {env_var} or update memory/context/email.md")
+
+
+# ---------------------------------------------------------------------------
+# Dispatch routing — [DISPATCH:Mac|VPS|Hermes] subject pattern
+# ---------------------------------------------------------------------------
+
+DISPATCH_SUBJECT_RE = re.compile(r'^\[DISPATCH:(Mac|VPS|Hermes)\]\s*(.*)', re.IGNORECASE)
+
+PLATFORM_NORMALIZE = {'mac': 'Mac', 'vps': 'VPS', 'hermes': 'Hermes'}
+
+
+def _load_rate_data(state_dir):
+    path = Path(os.path.expanduser(state_dir)) / 'dispatch-rate.json'
+    if path.exists():
+        with open(path) as f:
+            return json.load(f)
+    return {}
+
+
+def _save_rate_data(state_dir, data):
+    path = Path(os.path.expanduser(state_dir)) / 'dispatch-rate.json'
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, 'w') as f:
+        json.dump(data, f, indent=2)
+
+
+def _check_rate_limit(state_dir, sender_email, limit_per_hour):
+    """Returns (allowed: bool). If allowed, records this dispatch timestamp."""
+    now = time.time()
+    cutoff = now - 3600
+    data = _load_rate_data(state_dir)
+    key = sender_email.lower()
+    recent = [t for t in data.get(key, []) if t > cutoff]
+    if len(recent) >= limit_per_hour:
+        return False
+    recent.append(now)
+    data[key] = recent
+    _save_rate_data(state_dir, data)
+    return True
+
+
+def handle_dispatch_email(email_data, config, logger):
+    """
+    Handle [DISPATCH:Mac|VPS|Hermes] emails.
+    Returns a dispatch log dict, or None if subject doesn't match.
+    Called before LLM routing — short-circuits normal flow on match.
+    """
+    dispatch_cfg = config.get('dispatch', {})
+    if not dispatch_cfg.get('enabled', False):
+        return None
+
+    subject = email_data.get('subject', '')
+    m = DISPATCH_SUBJECT_RE.match(subject)
+    if not m:
+        return None
+
+    platform = PLATFORM_NORMALIZE.get(m.group(1).lower(), m.group(1))
+    task_name_raw = m.group(2).strip()
+    if not task_name_raw:
+        task_name_raw = f"task-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
+    task_name = re.sub(r'[^\w\-]', '-', task_name_raw).strip('-') or 'task'
+
+    iso_now = datetime.now().strftime('%Y%m%dT%H%M%S')
+    log_dir = Path(os.path.expanduser(config['log_dir']))
+    state_dir = str(Path(os.path.expanduser(config['state_file'])).parent)
+
+    sender_raw = email_data.get('from', '')
+    # Extract bare address from "Name <addr>" format
+    m_addr = re.search(r'<([^>]+)>', sender_raw)
+    sender_email = m_addr.group(1).strip().lower() if m_addr else sender_raw.strip().lower()
+
+    allowed = [s.lower() for s in dispatch_cfg.get('allowed_senders', [])]
+
+    def _reject(reason, reply_body):
+        reject_log = {
+            'type': 'dispatch_rejected',
+            'from': sender_raw,
+            'sender_email': sender_email,
+            'subject': subject,
+            'platform': platform,
+            'task_name': task_name,
+            'reason': reason,
+            'timestamp': datetime.now().isoformat(),
+        }
+        logging.warning(f"Dispatch rejected ({reason}): {sender_email}")
+        with open(log_dir / f'dispatch-rejected-{iso_now}.json', 'w') as f:
+            json.dump(reject_log, f, indent=2)
+        try:
+            send_email(config, sender_raw, f'Re: {subject}', reply_body,
+                       in_reply_to=email_data.get('message_id'),
+                       references=email_data.get('references'))
+        except Exception as e:
+            logging.error(f"Failed to send rejection reply: {e}")
+        return reject_log
+
+    # Security: sender allowlist
+    if sender_email not in allowed:
+        return _reject('sender_not_allowlisted',
+                        'Dispatch refused: sender not on allowlist.')
+
+    body = email_data.get('body', '')
+
+    # Security: body size limit
+    body_max = dispatch_cfg.get('body_max_bytes', 51200)
+    if len(body.encode('utf-8')) > body_max:
+        return _reject('body_too_large',
+                        f'Dispatch refused: body too large for dispatch (limit {body_max} bytes).')
+
+    # Security: rate limit
+    rate_limit = dispatch_cfg.get('rate_limit_per_hour', 5)
+    if not _check_rate_limit(state_dir, sender_email, rate_limit):
+        return _reject('rate_limit_exceeded',
+                        f'Dispatch refused: rate limit exceeded ({rate_limit} dispatches/hour).')
+
+    body_hash = hashlib.sha256(body.encode()).hexdigest()[:16]
+    audit_path = f'~/Projects/SOMA/audits/{iso_now}-{task_name}.md'
+
+    dispatch_log = {
+        'type': 'dispatch',
+        'from': sender_raw,
+        'sender_email': sender_email,
+        'subject': subject,
+        'platform': platform,
+        'task_name': task_name,
+        'body_hash': body_hash,
+        'timestamp': datetime.now().isoformat(),
+    }
+
+    platforms_cfg = dispatch_cfg.get('platforms', {})
+
+    if platform == 'Mac':
+        mac_cmd = os.path.expanduser(
+            platforms_cfg.get('Mac', {}).get('command', '~/.local/bin/cc-dispatch')
+        )
+        if not os.path.exists(mac_cmd):
+            logging.error(f"cc-dispatch not found at {mac_cmd}")
+            dispatch_log['result'] = 'error:cc-dispatch_not_found'
+            try:
+                send_email(config, sender_raw, f'Re: {subject}',
+                           f'Dispatch failed: cc-dispatch not found at {mac_cmd}. '
+                           'Install cc-dispatch to enable Mac dispatch.',
+                           in_reply_to=email_data.get('message_id'),
+                           references=email_data.get('references'))
+            except Exception as e:
+                logging.error(f"Failed to send error reply: {e}")
+        else:
+            proc = subprocess.Popen(
+                [mac_cmd, task_name, body],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            dispatch_log['dispatch_pid'] = proc.pid
+            logging.info(f"[DISPATCH:Mac] task={task_name} pid={proc.pid}")
+            try:
+                send_email(
+                    config, sender_raw, f'Re: {subject}',
+                    f"Dispatch confirmed.\n\n"
+                    f"Platform: Mac\n"
+                    f"Task: {task_name}\n"
+                    f"Report: {audit_path}\n\n"
+                    f"Check status: ls ~/Projects/SOMA/audits/ | grep {task_name}",
+                    in_reply_to=email_data.get('message_id'),
+                    references=email_data.get('references'),
+                )
+            except Exception as e:
+                logging.error(f"Failed to send confirmation reply: {e}")
+
+    elif platform == 'VPS':
+        vps_cfg = platforms_cfg.get('VPS', {})
+        ssh_target = vps_cfg.get('ssh_target', 'dev@vpsmikewolf.duckdns.org')
+        vps_cmd = vps_cfg.get('command', '~/.local/bin/cc-dispatch')
+        ssh_cmd = [
+            'ssh', '-o', 'StrictHostKeyChecking=no', '-o', 'ConnectTimeout=15',
+            ssh_target,
+            f'{vps_cmd} {shlex.quote(task_name)} {shlex.quote(body)}',
+        ]
+        try:
+            result = subprocess.run(ssh_cmd, capture_output=True, text=True, timeout=30)
+            dispatch_log['ssh_exit'] = result.returncode
+            dispatch_log['ssh_stderr'] = result.stderr[:500]
+            stderr_lc = result.stderr.lower()
+            if result.returncode != 0 and ('command not found' in stderr_lc or 'no such file' in stderr_lc):
+                err = f'VPS dispatch failed: cc-dispatch not found on VPS.\n{result.stderr[:300]}'
+                logging.error(err)
+                send_email(config, sender_raw, f'Re: {subject}', err,
+                           in_reply_to=email_data.get('message_id'),
+                           references=email_data.get('references'))
+            elif result.returncode != 0:
+                err = f'VPS dispatch failed (exit {result.returncode}):\n{result.stderr[:300]}'
+                logging.error(err)
+                send_email(config, sender_raw, f'Re: {subject}', err,
+                           in_reply_to=email_data.get('message_id'),
+                           references=email_data.get('references'))
+            else:
+                logging.info(f"[DISPATCH:VPS] task={task_name} exit=0")
+                send_email(
+                    config, sender_raw, f'Re: {subject}',
+                    f"Dispatch confirmed.\n\n"
+                    f"Platform: VPS\n"
+                    f"Task: {task_name}\n"
+                    f"Report: {audit_path} (on VPS)\n\n"
+                    f"Check: ssh {ssh_target} 'ls ~/Projects/SOMA/audits/ | grep {task_name}'",
+                    in_reply_to=email_data.get('message_id'),
+                    references=email_data.get('references'),
+                )
+        except subprocess.TimeoutExpired:
+            dispatch_log['ssh_exit'] = -1
+            dispatch_log['result'] = 'error:ssh_timeout'
+            logging.error(f"VPS SSH timed out for task={task_name}")
+        except Exception as e:
+            dispatch_log['result'] = f'error:{e}'
+            logging.error(f"VPS dispatch error: {e}")
+
+    elif platform == 'Hermes':
+        # TODO: Hermes dispatch — not yet installed on VPS
+        logging.info(f"[DISPATCH:Hermes] not yet implemented, notifying sender")
+        dispatch_log['result'] = 'hermes_not_available'
+        try:
+            send_email(
+                config, sender_raw, f'Re: {subject}',
+                "Hermes Agent not yet installed on VPS — falling back to VPS dispatch.\n\n"
+                f"To dispatch via VPS instead, resend with subject: [DISPATCH:VPS] {task_name_raw}",
+                in_reply_to=email_data.get('message_id'),
+                references=email_data.get('references'),
+            )
+        except Exception as e:
+            logging.error(f"Failed to send Hermes fallback reply: {e}")
+
+    # Write structured dispatch log
+    log_path = log_dir / f'dispatch-{iso_now}.json'
+    with open(log_path, 'w') as f:
+        json.dump(dispatch_log, f, indent=2)
+    logging.info(f"Dispatch log: {log_path}")
+
+    return dispatch_log
 
 
 # ---------------------------------------------------------------------------
@@ -465,6 +710,18 @@ def run_cycle(config, state, logger, dry_run=False):
         logging.info(f"Found {len(new_emails)} new email(s) in Claude's inbox")
 
         for em in new_emails:
+            # Dispatch emails short-circuit LLM routing entirely
+            if DISPATCH_SUBJECT_RE.match(em.get('subject', '')):
+                if not dry_run:
+                    dispatch_result = handle_dispatch_email(em, config, logger)
+                    results.append(dispatch_result or {})
+                    logging.info(f"  [dispatch] {em['subject'][:60]}")
+                else:
+                    logging.info(f"  [dispatch/dry-run] {em['subject'][:60]}")
+                    results.append({"action": "dispatch_dry_run", "subject": em["subject"]})
+                state.mark_processed("inbox", em["stable_id"])
+                continue
+
             email_text = f"From: {em['from']}\nSubject: {em['subject']}\n\n{em['body']}"
             decision = route_email(config, email_text)
             decision = apply_policy_overrides(config, em, decision)
