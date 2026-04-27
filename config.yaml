@@ -65,5 +65,8 @@ dispatch:
     VPS:
       ssh_target: dev@vpsmikewolf.duckdns.org
       command: ~/.local/bin/cc-dispatch
+      # Pin the VPS host key here as a known_hosts entry or key-only value,
+      # or pre-populate ~/.ssh/known_hosts for ssh_target.
+      # host_key: vpsmikewolf.duckdns.org ssh-ed25519 AAAA...
     Hermes:
       enabled: false  # not yet installed on VPS

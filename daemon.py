@@ -117,6 +117,45 @@ def _check_rate_limit(state_dir, sender_email, limit_per_hour):
     return True
 
 
+def _ssh_host_from_target(ssh_target):
+    target_host = ssh_target.rsplit('@', 1)[-1]
+    if target_host.startswith('['):
+        return target_host.split(']', 1)[0].lstrip('[')
+    return target_host.split(':', 1)[0]
+
+
+def _vps_known_hosts_file(vps_cfg, ssh_target, state_dir):
+    host_key = (
+        vps_cfg.get('host_key')
+        or vps_cfg.get('accepted_host_key')
+        or vps_cfg.get('AcceptedHostKeys')
+    )
+    if host_key:
+        known_hosts_line = host_key.strip()
+        first_field = known_hosts_line.split(maxsplit=1)[0]
+        key_only_prefixes = ('ssh-', 'ecdsa-', 'sk-')
+        if first_field.startswith(key_only_prefixes):
+            known_hosts_line = f'{_ssh_host_from_target(ssh_target)} {known_hosts_line}'
+
+        path = Path(os.path.expanduser(state_dir)) / 'dispatch-vps-known-hosts'
+        path.parent.mkdir(parents=True, exist_ok=True)
+        expected = f'{known_hosts_line}\n'
+        if not path.exists() or path.read_text() != expected:
+            path.write_text(expected)
+            path.chmod(0o600)
+        return path
+
+    known_hosts_file = Path(os.path.expanduser(vps_cfg.get('known_hosts_file', '~/.ssh/known_hosts')))
+    if known_hosts_file.exists():
+        return known_hosts_file
+
+    raise RuntimeError(
+        'VPS SSH host key is not pinned. Set dispatch.platforms.VPS.host_key '
+        'to the expected known_hosts entry, or configure known_hosts_file with '
+        'a pre-populated known_hosts file.'
+    )
+
+
 def handle_dispatch_email(email_data, config, logger):
     """
     Handle [DISPATCH:Mac|VPS|Hermes] emails.
@@ -247,24 +286,50 @@ def handle_dispatch_email(email_data, config, logger):
         vps_cfg = platforms_cfg.get('VPS', {})
         ssh_target = vps_cfg.get('ssh_target', 'dev@vpsmikewolf.duckdns.org')
         vps_cmd = vps_cfg.get('command', '~/.local/bin/cc-dispatch')
-        ssh_cmd = [
-            'ssh', '-o', 'StrictHostKeyChecking=no', '-o', 'ConnectTimeout=15',
-            ssh_target,
-            f'{vps_cmd} {shlex.quote(task_name)} {shlex.quote(body)}',
-        ]
         try:
-            result = subprocess.run(ssh_cmd, capture_output=True, text=True, timeout=30)
+            known_hosts_file = _vps_known_hosts_file(vps_cfg, ssh_target, state_dir)
+            ssh_cmd = [
+                'ssh',
+                '-T',
+                '-o', 'StrictHostKeyChecking=yes',
+                '-o', f'UserKnownHostsFile={known_hosts_file}',
+                '-o', 'UpdateHostKeys=no',
+                '-o', 'ConnectTimeout=15',
+                ssh_target,
+                f'exec {vps_cmd} {shlex.quote(task_name)}',
+            ]
+            result = subprocess.run(
+                ssh_cmd,
+                input=body.encode('utf-8'),
+                capture_output=True,
+                timeout=30,
+            )
+            stderr = result.stderr.decode('utf-8', errors='replace')
             dispatch_log['ssh_exit'] = result.returncode
-            dispatch_log['ssh_stderr'] = result.stderr[:500]
-            stderr_lc = result.stderr.lower()
+            dispatch_log['ssh_stderr'] = stderr[:500]
+            stderr_lc = stderr.lower()
             if result.returncode != 0 and ('command not found' in stderr_lc or 'no such file' in stderr_lc):
-                err = f'VPS dispatch failed: cc-dispatch not found on VPS.\n{result.stderr[:300]}'
+                err = f'VPS dispatch failed: cc-dispatch not found on VPS.\n{stderr[:300]}'
+                logging.error(err)
+                send_email(config, sender_raw, f'Re: {subject}', err,
+                           in_reply_to=email_data.get('message_id'),
+                           references=email_data.get('references'))
+            elif result.returncode != 0 and (
+                'host key verification failed' in stderr_lc
+                or 'strict host key checking' in stderr_lc
+                or 'no hostkey alg' in stderr_lc
+            ):
+                err = (
+                    'VPS dispatch failed: SSH host key verification failed. '
+                    'Confirm dispatch.platforms.VPS.host_key or known_hosts_file before retrying.\n'
+                    f'{stderr[:300]}'
+                )
                 logging.error(err)
                 send_email(config, sender_raw, f'Re: {subject}', err,
                            in_reply_to=email_data.get('message_id'),
                            references=email_data.get('references'))
             elif result.returncode != 0:
-                err = f'VPS dispatch failed (exit {result.returncode}):\n{result.stderr[:300]}'
+                err = f'VPS dispatch failed (exit {result.returncode}):\n{stderr[:300]}'
                 logging.error(err)
                 send_email(config, sender_raw, f'Re: {subject}', err,
                            in_reply_to=email_data.get('message_id'),
@@ -285,6 +350,12 @@ def handle_dispatch_email(email_data, config, logger):
             dispatch_log['ssh_exit'] = -1
             dispatch_log['result'] = 'error:ssh_timeout'
             logging.error(f"VPS SSH timed out for task={task_name}")
+        except RuntimeError as e:
+            dispatch_log['result'] = 'error:ssh_host_key_not_pinned'
+            logging.error(f"VPS dispatch refused: {e}")
+            send_email(config, sender_raw, f'Re: {subject}', f'Dispatch refused: {e}',
+                       in_reply_to=email_data.get('message_id'),
+                       references=email_data.get('references'))
         except Exception as e:
             dispatch_log['result'] = f'error:{e}'
             logging.error(f"VPS dispatch error: {e}")
