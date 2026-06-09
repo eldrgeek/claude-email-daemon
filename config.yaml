@@ -70,3 +70,17 @@ dispatch:
       # host_key: vpsmikewolf.duckdns.org ssh-ed25519 AAAA...
     Hermes:
       enabled: false  # not yet installed on VPS
+
+# --- Greg Foster pipeline ---
+# Autonomous handling of emails from Greg Foster (Legends Member Services Committee)
+# Greg is trusted to approve on-site website work and proposals under cost_threshold_usd.
+# Everything else (off-site, high-cost, destructive, ambiguous) goes to Mike.
+greg_pipeline:
+  enabled: true
+  email: gfos44@gmail.com
+  # auto_dispatch: set to false to disable autonomous dispatch and route all Greg requests to Mike
+  auto_dispatch: true
+  # CC Mike on every autonomous dispatch for transparency
+  cc_mike_on_dispatch: true
+  # Requests mentioning costs above this dollar amount go to Mike regardless of type
+  cost_threshold_usd: 100

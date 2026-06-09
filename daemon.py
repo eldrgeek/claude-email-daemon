@@ -512,6 +512,7 @@ def fetch_new_emails(imap_server, address, password, state, source="inbox"):
             "date": msg["Date"] or "",
             "body": extract_body(msg)[:2000],  # Truncate long bodies
             "references": msg.get("References", ""),
+            "authentication_results": msg.get("Authentication-Results", ""),
         })
 
     mail.logout()
@@ -557,8 +558,8 @@ def fetch_claude_drafts(imap_server, address, password, draft_prefix, state):
     return drafts
 
 
-def send_email(config, to, subject, body, in_reply_to=None, references=None):
-    """Send an email from Claude's account."""
+def send_email(config, to, subject, body, in_reply_to=None, references=None, cc=None):
+    """Send an email from Claude's account. cc is an optional list of addresses."""
     password = get_password("claude", "CLAUDE_EMAIL_PW", "Account")
     cfg = config["claude_email"]
 
@@ -570,14 +571,294 @@ def send_email(config, to, subject, body, in_reply_to=None, references=None):
         msg["In-Reply-To"] = in_reply_to
     if references:
         msg["References"] = references
+    if cc:
+        msg["Cc"] = ", ".join(cc) if isinstance(cc, list) else cc
     msg.attach(MIMEText(body, "plain"))
+
+    recipients = [to]
+    if cc:
+        recipients += (cc if isinstance(cc, list) else [cc])
 
     with smtplib.SMTP(cfg["smtp_server"], cfg["smtp_port"]) as server:
         server.starttls()
         server.login(cfg["address"], password)
-        server.sendmail(cfg["address"], [to], msg.as_string())
+        server.sendmail(cfg["address"], recipients, msg.as_string())
 
     return True
+
+
+# ---------------------------------------------------------------------------
+# Greg Foster pipeline — autonomous Legends Member Services email handling
+# ---------------------------------------------------------------------------
+
+GREG_CLASSIFY_PROMPT = """You are classifying an email from Greg Foster (Legends Member Services Committee) to determine safe routing.
+
+Classify into exactly one category. Respond with valid JSON only.
+
+Categories:
+- "on_site_build": Request to build, modify, or fix something on the Legends website
+- "proposal_with_cost": Request that explicitly mentions a cost or budget amount
+- "off_site_research": Research, data gathering, or work not directly on the Legends website
+- "destructive": Requests to delete, drop, wipe, remove, or irreversibly change data or systems
+- "access_control": Requests about passwords, credentials, permissions, or account access
+- "ambiguous": Unclear intent, insufficient context, or multiple conflicting categories
+
+Extract any explicitly mentioned dollar amounts.
+
+Respond ONLY with JSON:
+{"category": "<category>", "reason": "<one sentence>", "cost_usd": <number or null>, "summary": "<2-3 sentence summary>"}
+"""
+
+
+def _check_dkim_spf(email_data):
+    """
+    Parse Authentication-Results header for explicit DKIM/SPF failures.
+    Returns False if an explicit fail is found (treat as spoofed), None otherwise.
+    """
+    auth_results = email_data.get("authentication_results", "").lower()
+    if not auth_results:
+        return None
+    if "dkim=fail" in auth_results or "spf=fail" in auth_results:
+        return False
+    return None
+
+
+def classify_greg_email(config, email_data):
+    """Ask the local LLM to classify a Greg email. Returns classification dict."""
+    llm = config["llm"]
+    email_text = (
+        f"Subject: {email_data.get('subject', '')}\n\n"
+        f"Body: {email_data.get('body', '')}"
+    )
+    try:
+        resp = requests.post(llm["endpoint"], json={
+            "model": llm["model"],
+            "prompt": f"{GREG_CLASSIFY_PROMPT}\n\nEmail:\n{email_text}",
+            "stream": False,
+            "options": {
+                "temperature": llm.get("temperature", 0.1),
+                "num_predict": llm.get("max_tokens", 200),
+            }
+        }, timeout=30)
+        raw = resp.json().get("response", "").strip()
+        json_str = raw
+        if "```" in json_str:
+            json_str = json_str.split("```")[1]
+            if json_str.startswith("json"):
+                json_str = json_str[4:]
+        return json.loads(json_str.strip())
+    except Exception as e:
+        return {
+            "category": "ambiguous",
+            "reason": f"Classification error: {e}",
+            "cost_usd": None,
+            "summary": "Could not classify — routing to Mike as precaution",
+            "error": str(e),
+        }
+
+
+def handle_greg_email(email_data, config, logger):
+    """
+    Handle emails from Greg Foster (Legends Member Services Committee).
+    Returns a routing result dict, or None if sender is not Greg.
+
+    Safety model:
+    - Explicit DKIM/SPF fail → escalate (spoofed sender)
+    - Wrong sender email → return None (not Greg, let normal routing handle it)
+    - Category destructive/access_control → always escalate regardless of auto_dispatch
+    - Category off_site_research/ambiguous → escalate
+    - Cost above cost_threshold_usd → escalate
+    - auto_dispatch disabled → escalate
+    - on_site_build or proposal_with_cost under threshold → auto-dispatch + reply Greg + cc Mike
+    """
+    greg_cfg = config.get("greg_pipeline", {})
+    if not greg_cfg.get("enabled", False):
+        return None
+
+    greg_email_addr = greg_cfg.get("email", "").lower().strip()
+
+    sender_raw = email_data.get("from", "")
+    m_addr = re.search(r'<([^>]+)>', sender_raw)
+    sender_email = m_addr.group(1).strip().lower() if m_addr else sender_raw.strip().lower()
+
+    if sender_email != greg_email_addr:
+        return None  # Not Greg — fall through to normal routing
+
+    iso_now = datetime.now().strftime('%Y%m%dT%H%M%S')
+    log_dir = Path(os.path.expanduser(config['log_dir']))
+    log_dir.mkdir(parents=True, exist_ok=True)
+    forward_to = config["forward_to"]
+
+    def _escalate_to_mike(reason, classification=None):
+        subject = f"[Greg/Legends] {email_data.get('subject', '')}"
+        body_parts = [
+            "Email from Greg Foster requires your attention.",
+            "",
+            f"Reason not auto-dispatched: {reason}",
+            "",
+        ]
+        if classification:
+            body_parts += [
+                f"Classification: {classification.get('category', 'unknown')}",
+                f"Summary: {classification.get('summary', '')}",
+                "",
+            ]
+        body_parts += [
+            "---",
+            f"From: {email_data.get('from', '')}",
+            f"Date: {email_data.get('date', '')}",
+            f"Subject: {email_data.get('subject', '')}",
+            "",
+            email_data.get("body", ""),
+        ]
+        result = {
+            "type": "greg_escalated",
+            "from": sender_raw,
+            "sender_email": sender_email,
+            "subject": email_data.get("subject", ""),
+            "escalation_reason": reason,
+            "classification": classification,
+            "timestamp": datetime.now().isoformat(),
+        }
+        try:
+            send_email(config, forward_to, subject, "\n".join(body_parts))
+            result["action_result"] = "escalated_to_mike"
+        except Exception as e:
+            result["action_result"] = f"escalation_send_error: {e}"
+            logging.error(f"Failed to escalate Greg email to Mike: {e}")
+        log_path = log_dir / f"greg-escalated-{iso_now}.json"
+        with open(log_path, "w") as f:
+            json.dump(result, f, indent=2)
+        logging.info(f"Greg email escalated to Mike: {reason}")
+        return result
+
+    # SENDER VERIFICATION: explicit DKIM/SPF failure → treat as spoofed
+    auth_ok = _check_dkim_spf(email_data)
+    if auth_ok is False:
+        return _escalate_to_mike("DKIM/SPF authentication failed — possible spoofed sender")
+
+    # Classify the email
+    classification = classify_greg_email(config, email_data)
+    category = classification.get("category", "ambiguous")
+    cost_usd = classification.get("cost_usd")
+
+    # SAFETY GUARDS: destructive and access_control are never auto-dispatched
+    if category in ("destructive", "access_control"):
+        return _escalate_to_mike(
+            f"Safety guard: '{category}' requests require Mike approval",
+            classification,
+        )
+
+    # Off-site or ambiguous → Mike
+    if category in ("off_site_research", "ambiguous"):
+        return _escalate_to_mike(
+            f"Category '{category}' requires Mike review",
+            classification,
+        )
+
+    # Cost threshold check
+    cost_threshold = greg_cfg.get("cost_threshold_usd", 100)
+    if cost_usd is not None and cost_usd > cost_threshold:
+        return _escalate_to_mike(
+            f"Cost ${cost_usd} exceeds threshold ${cost_threshold}",
+            classification,
+        )
+
+    # auto_dispatch gate
+    auto_dispatch = greg_cfg.get("auto_dispatch", False)
+    if not auto_dispatch:
+        return _escalate_to_mike(
+            "auto_dispatch is disabled — routing to Mike for manual approval",
+            classification,
+        )
+
+    # AUTO-DISPATCH path
+    task_name_raw = email_data.get("subject", "greg-legends-task")
+    task_name = re.sub(r'[^\w\-]', '-', task_name_raw).strip('-') or 'greg-task'
+    task_name = task_name[:40]
+    audit_path = f"~/Projects/SOMA/audits/{iso_now}-{task_name}.md"
+
+    prompt = (
+        "## Context\n"
+        f"Email from Greg Foster ({greg_email_addr}), Legends Member Services Committee.\n"
+        f"Subject: {email_data.get('subject', '')}\n\n"
+        f"## Email Body\n{email_data.get('body', '')}\n\n"
+        "## Task\n"
+        f"Handle this Legends website work request from Greg. "
+        f"Category: {category}. "
+        "Complete the requested work and report back.\n\n"
+        "## Done criteria\n"
+        f"Changes complete, tested, and a summary written to {audit_path}"
+    )
+
+    dispatch_result = {
+        "type": "greg_dispatched",
+        "from": sender_raw,
+        "sender_email": sender_email,
+        "subject": email_data.get("subject", ""),
+        "classification": classification,
+        "task_name": task_name,
+        "timestamp": datetime.now().isoformat(),
+    }
+
+    mac_cmd = os.path.expanduser(
+        config.get("dispatch", {}).get("platforms", {}).get("Mac", {}).get(
+            "command", "~/.local/bin/cc-dispatch"
+        )
+    )
+    if not os.path.exists(mac_cmd):
+        logging.error(f"cc-dispatch not found at {mac_cmd}")
+        dispatch_result["action_result"] = "error:cc-dispatch_not_found"
+        return _escalate_to_mike(f"cc-dispatch not found at {mac_cmd}", classification)
+
+    try:
+        proc = subprocess.Popen(
+            [mac_cmd, task_name, prompt],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        dispatch_result["dispatch_pid"] = proc.pid
+        dispatch_result["action_result"] = "dispatched"
+        logging.info(f"[GREG/dispatch] task={task_name} pid={proc.pid}")
+    except Exception as e:
+        dispatch_result["action_result"] = f"dispatch_error: {e}"
+        logging.error(f"Failed to dispatch Greg task: {e}")
+        return _escalate_to_mike(f"Dispatch failed: {e}", classification)
+
+    # Reply to Greg + optionally CC Mike
+    reply_body = (
+        f"Hi Greg,\n\n"
+        f"I've received your request and started working on it.\n\n"
+        f"Task: {task_name}\n"
+        f"Report: {audit_path}\n\n"
+        f"I'll follow up when complete.\n\n"
+        "Best,\nClaude\n(AI assistant for the Legends website)"
+    )
+    cc_list = []
+    if greg_cfg.get("cc_mike_on_dispatch", True):
+        cc_list.append(forward_to)
+
+    try:
+        send_email(
+            config,
+            sender_raw,
+            f"Re: {email_data.get('subject', '')}",
+            reply_body,
+            in_reply_to=email_data.get("message_id"),
+            references=email_data.get("references"),
+            cc=cc_list if cc_list else None,
+        )
+        dispatch_result["reply_sent"] = True
+    except Exception as e:
+        dispatch_result["reply_sent"] = False
+        dispatch_result["reply_error"] = str(e)
+        logging.error(f"Failed to send reply to Greg: {e}")
+
+    log_path = log_dir / f"greg-dispatched-{iso_now}.json"
+    with open(log_path, "w") as f:
+        json.dump(dispatch_result, f, indent=2)
+
+    return dispatch_result
 
 
 # ---------------------------------------------------------------------------
@@ -792,6 +1073,23 @@ def run_cycle(config, state, logger, dry_run=False):
                     results.append({"action": "dispatch_dry_run", "subject": em["subject"]})
                 state.mark_processed("inbox", em["stable_id"])
                 continue
+
+            # Greg pipeline: check before general LLM routing
+            greg_result = handle_greg_email(em, config, logger) if not dry_run else None
+            if greg_result is not None:
+                results.append(greg_result)
+                state.mark_processed("inbox", em["stable_id"])
+                logging.info(f"  [greg/{greg_result.get('type', '?')}] {em['subject'][:60]}")
+                continue
+            if dry_run and config.get("greg_pipeline", {}).get("enabled"):
+                _from_raw = em.get("from", "")
+                _m = re.search(r'<([^>]+)>', _from_raw)
+                _sender = _m.group(1).strip().lower() if _m else _from_raw.strip().lower()
+                if _sender == config["greg_pipeline"].get("email", "").lower():
+                    logging.info(f"  [greg/dry-run] {em['subject'][:60]}")
+                    results.append({"action": "greg_dry_run", "subject": em["subject"]})
+                    state.mark_processed("inbox", em["stable_id"])
+                    continue
 
             email_text = f"From: {em['from']}\nSubject: {em['subject']}\n\n{em['body']}"
             decision = route_email(config, email_text)
