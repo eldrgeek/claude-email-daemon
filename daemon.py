@@ -623,13 +623,43 @@ def _check_dkim_spf(email_data):
     return None
 
 
+def _parse_classify_json(raw):
+    """Extract and parse JSON from a classifier response string."""
+    json_str = raw
+    if "```" in json_str:
+        json_str = json_str.split("```")[1]
+        if json_str.startswith("json"):
+            json_str = json_str[4:]
+    # Find the first '{' in case there's leading prose
+    brace = json_str.find("{")
+    if brace > 0:
+        json_str = json_str[brace:]
+    return json.loads(json_str.strip())
+
+
+def _classify_via_vps_fallback(email_text):
+    """Classify Greg email via VPS Haiku endpoint. Returns classification dict or raises."""
+    vps_url = "https://vpsmikewolf.duckdns.org/infer/ask"
+    question = (
+        GREG_CLASSIFY_PROMPT
+        + "\n\nEmail:\n" + email_text
+        + "\n\nRespond with valid JSON only — no other text."
+    )
+    resp = requests.post(vps_url, json={"question": question, "context": ""}, timeout=45)
+    raw = resp.json().get("answer", "").strip()
+    result = _parse_classify_json(raw)
+    result["classifier"] = "vps_haiku_fallback"
+    return result
+
+
 def classify_greg_email(config, email_data):
-    """Ask the local LLM to classify a Greg email. Returns classification dict."""
+    """Ask the local LLM to classify a Greg email. Falls back to VPS Haiku if Ollama is down."""
     llm = config["llm"]
     email_text = (
         f"Subject: {email_data.get('subject', '')}\n\n"
         f"Body: {email_data.get('body', '')}"
     )
+    ollama_error = None
     try:
         resp = requests.post(llm["endpoint"], json={
             "model": llm["model"],
@@ -641,19 +671,24 @@ def classify_greg_email(config, email_data):
             }
         }, timeout=30)
         raw = resp.json().get("response", "").strip()
-        json_str = raw
-        if "```" in json_str:
-            json_str = json_str.split("```")[1]
-            if json_str.startswith("json"):
-                json_str = json_str[4:]
-        return json.loads(json_str.strip())
+        result = _parse_classify_json(raw)
+        result["classifier"] = "ollama"
+        return result
     except Exception as e:
+        ollama_error = e
+        logging.warning(f"Ollama classifier failed ({e}), trying VPS fallback")
+
+    try:
+        return _classify_via_vps_fallback(email_text)
+    except Exception as e2:
+        logging.error(f"VPS fallback classifier also failed: {e2}")
         return {
             "category": "ambiguous",
-            "reason": f"Classification error: {e}",
+            "reason": f"Classification error (ollama: {ollama_error}; vps: {e2})",
             "cost_usd": None,
             "summary": "Could not classify — routing to Mike as precaution",
-            "error": str(e),
+            "error": str(e2),
+            "classifier": "none",
         }
 
 
