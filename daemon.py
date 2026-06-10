@@ -1141,6 +1141,7 @@ def run_cycle(config, state, logger, dry_run=False):
         logging.error(f"Error checking Claude's inbox: {e}")
 
     # 2. Check Mike's drafts (if configured)
+    _auth_alert_path = Path(os.path.expanduser("~/Projects/SOMA/state/email-daemon-auth-alert.json"))
     try:
         mike_pw = get_password("mikeai", "MIKE_EMAIL_PW", "Mike's AI Account")
     except RuntimeError:
@@ -1156,6 +1157,9 @@ def run_cycle(config, state, logger, dry_run=False):
                 state,
             )
             logging.info(f"Found {len(drafts)} new Claude draft(s)")
+            # Clear any stale auth-alert since credentials are now working
+            if _auth_alert_path.exists():
+                _auth_alert_path.unlink()
 
             for draft in drafts:
                 email_text = f"Subject: {draft['subject']}\n\n{draft['body']}"
@@ -1167,7 +1171,23 @@ def run_cycle(config, state, logger, dry_run=False):
                 logging.info(f"  [draft] {draft['subject'][:60]}")
 
         except Exception as e:
-            logging.error(f"Error checking Mike's drafts: {e}")
+            err_str = str(e)
+            is_auth = "AUTHENTICATIONFAILED" in err_str or "Invalid credentials" in err_str
+            if is_auth:
+                # Rate-limit the log line to once per hour; always update health state file
+                _auth_last_log = Path(os.path.expanduser("~/Projects/SOMA/state/email-daemon-auth-last-log"))
+                now_ts = time.time()
+                last_log = float(_auth_last_log.read_text()) if _auth_last_log.exists() else 0
+                if now_ts - last_log > 3600:
+                    logging.error(f"mikeai@ AUTHENTICATIONFAILED — stale app password; needs Mike to regenerate")
+                    _auth_last_log.write_text(str(now_ts))
+                _auth_alert_path.parent.mkdir(parents=True, exist_ok=True)
+                _auth_alert_path.write_text(json.dumps({
+                    "ts": datetime.now().isoformat(),
+                    "msg": "mikeai@ AUTHENTICATIONFAILED — stale app password, needs Mike to regenerate in Google Account",
+                }))
+            else:
+                logging.error(f"Error checking Mike's drafts: {e}")
     else:
         logging.debug("Skipping draft check — MIKE_EMAIL_PW not set")
 
