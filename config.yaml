@@ -71,18 +71,41 @@ dispatch:
     Hermes:
       enabled: false  # not yet installed on VPS
 
-# --- Greg Foster pipeline ---
-# Autonomous handling of emails from Greg Foster (Legends Member Services Committee)
-# Greg is trusted to approve on-site website work and proposals under cost_threshold_usd.
-# Everything else (off-site, high-cost, destructive, ambiguous) goes to Mike.
-greg_pipeline:
-  enabled: true
-  email: gfos44@gmail.com
-  # auto_dispatch: set to false to disable autonomous dispatch and route all Greg requests to Mike
-  auto_dispatch: true
-  # CC Mike on every autonomous dispatch for transparency
-  cc_mike_on_dispatch: true
-  # Requests mentioning costs above this dollar amount go to Mike regardless of type
-  cost_threshold_usd: 100
-  # Hours to wait for a task report before timing out and notifying Greg + Mike
-  completion_timeout_hours: 4
+# --- Trusted requester pipeline ---
+# Per-sender dispatch tiers. Each entry configures how emails from that address are handled.
+#
+# Tiers:
+#   member_services  – auto-dispatch on-site builds under cost_threshold_usd;
+#                      escalate destructive / access_control / off_site / high_cost to escalate_to
+#   owner            – auto-dispatch everything not caught by hard stops; no cost cap;
+#                      hard stops (destructive, access_control) are surfaced as manual-action notices
+#
+# HARD STOPS (all tiers): destructive, access_control — NEVER auto-executed.
+#
+trusted_requesters:
+  gfos44@gmail.com:
+    name: Greg Foster
+    tier: member_services
+    auto_dispatch: true
+    # CC Mike on every ack and completion email for transparency
+    cc_dispatch_to:
+      - mw@mike-wolf.com
+    # Requests mentioning costs above this threshold go to escalate_to
+    cost_threshold_usd: 100
+    completion_timeout_hours: 4
+    escalate_to: mw@mike-wolf.com
+    ack_greeting: "Hi Greg,"
+    ack_signature: "Claude\n(AI assistant for the Legends website)"
+
+  mw@mike-wolf.com:
+    name: Mike Wolf
+    tier: owner
+    auto_dispatch: true
+    # Dynamic CC: daemon adds member_services senders who were on the thread
+    cc_dispatch_to: []
+    # No cost cap for owner tier (null = unlimited)
+    cost_threshold_usd: null
+    completion_timeout_hours: 4
+    # No escalate_to — owner IS the escalation target; hard stops surface to owner directly
+    ack_greeting: "Hi Mike,"
+    ack_signature: "Claude"

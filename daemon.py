@@ -78,6 +78,35 @@ def get_password(label, env_var, memory_section=None):
     raise RuntimeError(f"No password for {label}. Set {env_var} or update memory/context/email.md")
 
 
+def _get_trusted_requesters(config):
+    """
+    Return {email_lower: requester_config} for all trusted senders.
+
+    Reads from trusted_requesters config (new style).  Falls back to
+    greg_pipeline for backward compatibility with old configs.
+    """
+    requesters = {}
+    for addr, cfg in config.get("trusted_requesters", {}).items():
+        requesters[addr.lower().strip()] = cfg
+    # Backward compat: auto-populate from greg_pipeline if not already present
+    greg_cfg = config.get("greg_pipeline", {})
+    if greg_cfg.get("enabled") and greg_cfg.get("email"):
+        greg_addr = greg_cfg["email"].lower().strip()
+        if greg_addr not in requesters:
+            requesters[greg_addr] = {
+                "name": "Greg Foster",
+                "tier": "member_services",
+                "auto_dispatch": greg_cfg.get("auto_dispatch", True),
+                "cc_dispatch_to": ([config["forward_to"]] if greg_cfg.get("cc_mike_on_dispatch") else []),
+                "cost_threshold_usd": greg_cfg.get("cost_threshold_usd", 100),
+                "completion_timeout_hours": greg_cfg.get("completion_timeout_hours", 4),
+                "escalate_to": config["forward_to"],
+                "ack_greeting": "Hi Greg,",
+                "ack_signature": "Claude\n(AI assistant for the Legends website)",
+            }
+    return requesters
+
+
 # ---------------------------------------------------------------------------
 # Dispatch routing — [DISPATCH:Mac|VPS|Hermes] subject pattern
 # ---------------------------------------------------------------------------
@@ -508,6 +537,7 @@ def fetch_new_emails(imap_server, address, password, state, source="inbox"):
             "message_id": message_id,
             "from": msg["From"] or "",
             "to": msg["To"] or "",
+            "cc": msg.get("Cc") or "",
             "subject": decode_subject(msg["Subject"]),
             "date": msg["Date"] or "",
             "body": extract_body(msg)[:2000],  # Truncate long bodies
@@ -692,29 +722,45 @@ def classify_greg_email(config, email_data):
         }
 
 
-def _greg_pending_path(config):
+def _pending_path(config):
     return Path(os.path.expanduser(config["state_file"])).parent / "greg-pending.json"
 
 
-def _load_greg_pending(config):
-    path = _greg_pending_path(config)
+def _load_pending(config):
+    path = _pending_path(config)
     if path.exists():
         with open(path) as f:
-            return json.load(f)
+            tasks = json.load(f)
+        # Normalize old-style records that use greg_from / greg_email
+        for task in tasks:
+            if "requester_from" not in task:
+                task["requester_from"] = task.get("greg_from", "")
+            if "requester_email" not in task:
+                task["requester_email"] = task.get("greg_email", "")
+            if "extra_cc" not in task:
+                task["extra_cc"] = []
+        return tasks
     return []
 
 
-def _save_greg_pending_list(config, tasks):
-    path = _greg_pending_path(config)
+def _save_pending_list(config, tasks):
+    path = _pending_path(config)
     path.parent.mkdir(parents=True, exist_ok=True)
     with open(path, "w") as f:
         json.dump(tasks, f, indent=2)
 
 
-def _save_greg_pending(config, task):
-    tasks = _load_greg_pending(config)
+def _save_pending(config, task):
+    tasks = _load_pending(config)
     tasks.append(task)
-    _save_greg_pending_list(config, tasks)
+    _save_pending_list(config, tasks)
+
+
+# Keep old names as aliases so any external scripts that import them still work.
+_greg_pending_path = _pending_path
+_load_greg_pending = _load_pending
+_save_greg_pending_list = _save_pending_list
+_save_greg_pending = _save_pending
 
 
 def _extract_report_summary(report_text, max_chars=3000):
@@ -737,23 +783,22 @@ def _extract_report_summary(report_text, max_chars=3000):
     return "\n".join(body_lines)[:max_chars].strip()
 
 
-def check_greg_completions(config, logger):
+def check_pending_completions(config, logger):
     """
-    Check if any pending Greg tasks have completed (audit report appeared on disk).
+    Check whether any pending trusted-requester tasks have completed (audit report on disk).
     Send completion emails when reports land; time out after completion_timeout_hours.
-    Called every daemon cycle.
+    Called every daemon cycle.  Handles both Greg-style and owner-tier tasks.
     """
-    greg_cfg = config.get("greg_pipeline", {})
-    if not greg_cfg.get("enabled", False):
+    requesters = _get_trusted_requesters(config)
+    if not requesters:
         return
 
-    pending = _load_greg_pending(config)
+    pending = _load_pending(config)
     if not pending:
         return
 
     audits_dir = Path(os.path.expanduser("~/Projects/SOMA/audits"))
     forward_to = config["forward_to"]
-    timeout_hours = greg_cfg.get("completion_timeout_hours", 4)
     updated = False
 
     for task in pending:
@@ -762,20 +807,29 @@ def check_greg_completions(config, logger):
 
         task_name = task["task_name"]
         dispatched_at = task.get("dispatched_at", "")
-        greg_from = task.get("greg_from", "")
+        requester_from = task.get("requester_from") or task.get("greg_from", "")
+        requester_email = (task.get("requester_email") or task.get("greg_email", "")).lower()
+        extra_cc = task.get("extra_cc", [])
         subject = task.get("subject", "")
+
+        # Requester config for personalised email text
+        req_cfg = requesters.get(requester_email, {})
+        ack_greeting = req_cfg.get("ack_greeting", "Hi,")
+        ack_signature = req_cfg.get("ack_signature", "Claude")
+        req_name = req_cfg.get("name", requester_email)
+        timeout_hours = req_cfg.get("completion_timeout_hours", 4)
+        tier = req_cfg.get("tier", "member_services")
 
         # Look for a matching report: *-{task_name}.md in audits dir
         matching = sorted(audits_dir.glob(f"*-{task_name}.md"))
-
         report_path = None
         report_text = ""
         if matching:
-            report_path = matching[-1]  # most recent match
+            report_path = matching[-1]
             try:
                 report_text = report_path.read_text(errors="replace")
             except OSError as e:
-                logging.warning(f"[greg/completion] could not read report {report_path}: {e}")
+                logging.warning(f"[completion] could not read report {report_path}: {e}")
 
         # Check timeout
         timed_out = False
@@ -789,67 +843,70 @@ def check_greg_completions(config, logger):
                 pass
 
         if report_path or timed_out:
-            # Compose completion email
             if report_path and report_text:
                 summary = _extract_report_summary(report_text)
                 email_body = (
-                    f"Hi Greg,\n\n"
+                    f"{ack_greeting}\n\n"
                     f"Your request has been completed.\n\n"
                     f"Task: {task_name}\n\n"
                     f"---\n\n"
                     f"{summary}\n\n"
                     f"---\n\n"
                     f"Full report: {report_path}\n\n"
-                    f"Best,\nClaude\n(AI assistant for the Legends website)"
+                    f"Best,\n{ack_signature}"
                 )
                 email_subject = f"Re: {subject} — Done"
-                log_type = "greg_completion_sent"
+                log_type = "completion_sent"
             else:
+                if tier == "owner":
+                    followup_note = "Please check the task status manually."
+                else:
+                    followup_note = "Mike has been notified and will follow up."
                 email_body = (
-                    f"Hi Greg,\n\n"
+                    f"{ack_greeting}\n\n"
                     f"Your request is taking longer than expected. "
-                    f"Mike has been notified and will follow up.\n\n"
+                    f"{followup_note}\n\n"
                     f"Task: {task_name}\n\n"
-                    f"Best,\nClaude\n(AI assistant for the Legends website)"
+                    f"Best,\n{ack_signature}"
                 )
                 email_subject = f"Re: {subject} — In Progress"
-                log_type = "greg_completion_timeout"
-                # Also alert Mike
-                try:
-                    send_email(
-                        config,
-                        forward_to,
-                        f"[Greg/Legends] Task timeout: {task_name}",
-                        f"Greg task '{task_name}' has been pending for >{timeout_hours}h with no audit report.\n"
-                        f"Dispatched at: {dispatched_at}\n"
-                        f"Expected report in: {audits_dir}/*-{task_name}.md\n\n"
-                        f"Original request from: {greg_from}\nSubject: {subject}",
-                    )
-                except Exception as e:
-                    logging.error(f"[greg/completion] failed to alert Mike about timeout: {e}")
+                log_type = "completion_timeout"
+                # Alert forward_to about timeout unless requester IS forward_to
+                if requester_email != forward_to.lower():
+                    try:
+                        send_email(
+                            config, forward_to,
+                            f"[{req_name}/Task] Timeout: {task_name}",
+                            f"Task '{task_name}' for {req_name} has been pending for >{timeout_hours}h with no audit report.\n"
+                            f"Dispatched at: {dispatched_at}\n"
+                            f"Expected report in: {audits_dir}/*-{task_name}.md\n\n"
+                            f"Original request from: {requester_from}\nSubject: {subject}",
+                        )
+                    except Exception as e:
+                        logging.error(f"[completion] failed to alert {forward_to} about timeout: {e}")
 
-            cc_list = [forward_to] if greg_cfg.get("cc_mike_on_dispatch", True) else []
+            cc_list = extra_cc if extra_cc else None
             try:
                 send_email(
                     config,
-                    greg_from,
+                    requester_from,
                     email_subject,
                     email_body,
                     in_reply_to=task.get("message_id") or None,
                     references=task.get("references") or None,
-                    cc=cc_list if cc_list else None,
+                    cc=cc_list,
                 )
                 task["notified"] = True
                 task["notified_at"] = datetime.now().isoformat()
                 task["report_path"] = str(report_path) if report_path else None
                 task["notify_type"] = log_type
                 updated = True
-                logging.info(f"[greg/completion] sent {log_type} for task={task_name} to {greg_from}")
+                logging.info(f"[completion] sent {log_type} for task={task_name} to {requester_from}")
             except Exception as e:
-                logging.error(f"[greg/completion] failed to send completion email for task={task_name}: {e}")
+                logging.error(f"[completion] failed to send completion for task={task_name}: {e}")
 
     if updated:
-        _save_greg_pending_list(config, pending)
+        _save_pending_list(config, pending)
         # Prune fully-notified tasks older than 7 days
         cutoff = datetime.now().timestamp() - 7 * 86400
         pruned = []
@@ -858,50 +915,63 @@ def check_greg_completions(config, logger):
                 notified_at = task.get("notified_at", "")
                 try:
                     if datetime.fromisoformat(notified_at).timestamp() < cutoff:
-                        continue  # drop old notified task
+                        continue
                 except ValueError:
                     pass
             pruned.append(task)
         if len(pruned) != len(pending):
-            _save_greg_pending_list(config, pruned)
+            _save_pending_list(config, pruned)
 
 
-def handle_greg_email(email_data, config, logger):
+# Keep old name as an alias so any external scripts still work.
+check_greg_completions = check_pending_completions
+
+
+def handle_trusted_email(email_data, config, logger):
     """
-    Handle emails from Greg Foster (Legends Member Services Committee).
-    Returns a routing result dict, or None if sender is not Greg.
+    Handle emails from trusted requesters (configured in trusted_requesters).
+    Returns a routing result dict, or None if the sender is not a trusted requester.
 
-    Safety model:
-    - Explicit DKIM/SPF fail → escalate (spoofed sender)
-    - Wrong sender email → return None (not Greg, let normal routing handle it)
-    - Category destructive/access_control → always escalate regardless of auto_dispatch
-    - Category off_site_research/ambiguous → escalate
-    - Cost above cost_threshold_usd → escalate
-    - auto_dispatch disabled → escalate
-    - on_site_build or proposal_with_cost under threshold → auto-dispatch + reply Greg + cc Mike
+    Tiers:
+      member_services (e.g. Greg Foster)
+        - Auto-dispatch: on_site_build, proposal_with_cost under cost_threshold_usd
+        - Escalate to escalate_to: destructive, access_control, off_site_research,
+          ambiguous, over-threshold costs, auto_dispatch=false
+      owner (e.g. Mike Wolf)
+        - Auto-dispatch: ALL categories EXCEPT hard stops
+        - No cost cap; no escalation path (owner is self)
+        - Hard stops (destructive, access_control) are SURFACED to the owner as a
+          manual-action notice — never auto-executed regardless of tier
+
+    SENDER VERIFICATION:
+      - owner tier: explicit DKIM/SPF fail → fall through to normal routing (return None)
+      - member_services tier: explicit DKIM/SPF fail → escalate as possible spoof
     """
-    greg_cfg = config.get("greg_pipeline", {})
-    if not greg_cfg.get("enabled", False):
-        return None
-
-    greg_email_addr = greg_cfg.get("email", "").lower().strip()
+    requesters = _get_trusted_requesters(config)
 
     sender_raw = email_data.get("from", "")
     m_addr = re.search(r'<([^>]+)>', sender_raw)
     sender_email = m_addr.group(1).strip().lower() if m_addr else sender_raw.strip().lower()
 
-    if sender_email != greg_email_addr:
-        return None  # Not Greg — fall through to normal routing
+    requester = requesters.get(sender_email)
+    if requester is None:
+        return None  # Not a trusted sender — fall through to normal routing
 
+    tier = requester.get("tier", "member_services")
+    req_name = requester.get("name", sender_email)
     iso_now = datetime.now().strftime('%Y%m%dT%H%M%S')
     log_dir = Path(os.path.expanduser(config['log_dir']))
     log_dir.mkdir(parents=True, exist_ok=True)
     forward_to = config["forward_to"]
+    ack_greeting = requester.get("ack_greeting", f"Hi {req_name},")
+    ack_signature = requester.get("ack_signature", "Claude")
 
-    def _escalate_to_mike(reason, classification=None):
-        subject = f"[Greg/Legends] {email_data.get('subject', '')}"
+    def _escalate(reason, classification=None):
+        """Forward to the designated escalation address with full context."""
+        escalate_to = requester.get("escalate_to", forward_to)
+        subj = f"[{req_name}/Request] {email_data.get('subject', '')}"
         body_parts = [
-            "Email from Greg Foster requires your attention.",
+            f"Email from {req_name} requires your attention.",
             "",
             f"Reason not auto-dispatched: {reason}",
             "",
@@ -921,92 +991,184 @@ def handle_greg_email(email_data, config, logger):
             email_data.get("body", ""),
         ]
         result = {
-            "type": "greg_escalated",
+            "type": "trusted_escalated",
+            "requester": req_name,
+            "tier": tier,
             "from": sender_raw,
             "sender_email": sender_email,
             "subject": email_data.get("subject", ""),
             "escalation_reason": reason,
+            "escalated_to": escalate_to,
             "classification": classification,
             "timestamp": datetime.now().isoformat(),
         }
         try:
-            send_email(config, forward_to, subject, "\n".join(body_parts))
-            result["action_result"] = "escalated_to_mike"
+            send_email(config, escalate_to, subj, "\n".join(body_parts))
+            result["action_result"] = "escalated"
         except Exception as e:
             result["action_result"] = f"escalation_send_error: {e}"
-            logging.error(f"Failed to escalate Greg email to Mike: {e}")
-        log_path = log_dir / f"greg-escalated-{iso_now}.json"
+            logging.error(f"[trusted/{req_name}] failed to escalate: {e}")
+        log_path = log_dir / f"trusted-escalated-{iso_now}.json"
         with open(log_path, "w") as f:
             json.dump(result, f, indent=2)
-        logging.info(f"Greg email escalated to Mike: {reason}")
+        logging.info(f"[trusted/{req_name}] escalated: {reason}")
         return result
 
-    # SENDER VERIFICATION: explicit DKIM/SPF failure → treat as spoofed
+    def _surface_hard_stop(classification, category):
+        """
+        Notify the owner-tier requester that a hard stop was triggered.
+        The request is NOT dispatched; they must act manually.
+        """
+        subj = f"[Hard Stop] {email_data.get('subject', '')} — manual action required"
+        body_parts = [
+            ack_greeting,
+            "",
+            "Your request contained a safety hard stop and was NOT auto-executed.",
+            "",
+            f"Hard stop: {category}",
+            f"Reason: {classification.get('reason', '')}",
+            "",
+            "Requests involving destructive operations, access-control changes, or",
+            "money movement are never auto-executed regardless of sender.",
+            "Please handle this manually.",
+            "",
+            f"Summary: {classification.get('summary', '')}",
+            "",
+            "---",
+            f"Original subject: {email_data.get('subject', '')}",
+            "",
+            email_data.get("body", ""),
+            "",
+            f"—{ack_signature}",
+        ]
+        result = {
+            "type": "hard_stop_surfaced",
+            "requester": req_name,
+            "tier": tier,
+            "from": sender_raw,
+            "sender_email": sender_email,
+            "subject": email_data.get("subject", ""),
+            "hard_stop_category": category,
+            "classification": classification,
+            "timestamp": datetime.now().isoformat(),
+        }
+        try:
+            send_email(config, sender_raw, subj, "\n".join(body_parts))
+            result["action_result"] = "hard_stop_notified"
+        except Exception as e:
+            result["action_result"] = f"notify_error: {e}"
+            logging.error(f"[trusted/{req_name}] failed to surface hard stop: {e}")
+        log_path = log_dir / f"trusted-hard-stop-{iso_now}.json"
+        with open(log_path, "w") as f:
+            json.dump(result, f, indent=2)
+        logging.info(f"[trusted/{req_name}] hard stop surfaced: {category}")
+        return result
+
+    # ----------------------------------------------------------------
+    # SENDER VERIFICATION: explicit DKIM/SPF failure
+    # ----------------------------------------------------------------
     auth_ok = _check_dkim_spf(email_data)
     if auth_ok is False:
-        return _escalate_to_mike("DKIM/SPF authentication failed — possible spoofed sender")
+        if tier == "owner":
+            # A DKIM/SPF failure on an owner-address email is a spoof signal.
+            # Fall through to normal routing rather than granting owner privileges.
+            logging.warning(
+                f"[trusted/{req_name}] DKIM/SPF fail on {sender_email} — "
+                "possible spoof; falling through to normal routing"
+            )
+            return None
+        return _escalate("DKIM/SPF authentication failed — possible spoofed sender")
 
+    # ----------------------------------------------------------------
     # Classify the email
+    # ----------------------------------------------------------------
     classification = classify_greg_email(config, email_data)
     category = classification.get("category", "ambiguous")
     cost_usd = classification.get("cost_usd")
 
-    # SAFETY GUARDS: destructive and access_control are never auto-dispatched
+    # ----------------------------------------------------------------
+    # HARD STOPS — apply to ALL tiers, including owner
+    # ----------------------------------------------------------------
     if category in ("destructive", "access_control"):
-        return _escalate_to_mike(
-            f"Safety guard: '{category}' requests require Mike approval",
+        if tier == "owner":
+            return _surface_hard_stop(classification, category)
+        return _escalate(
+            f"Safety guard: '{category}' requests require manual approval",
             classification,
         )
 
-    # Off-site or ambiguous → Mike
-    if category in ("off_site_research", "ambiguous"):
-        return _escalate_to_mike(
-            f"Category '{category}' requires Mike review",
-            classification,
-        )
+    # ----------------------------------------------------------------
+    # Tier-specific routing
+    # ----------------------------------------------------------------
+    if tier == "owner":
+        auto_dispatch = requester.get("auto_dispatch", True)
+        if not auto_dispatch:
+            return _surface_hard_stop(
+                {"category": "auto_dispatch_disabled",
+                 "reason": "auto_dispatch is disabled for owner tier",
+                 "summary": "auto_dispatch disabled"},
+                "auto_dispatch_disabled",
+            )
+        # Determine dynamic CC: include any member_services-tier trusted sender
+        # who was on the original thread (To or Cc headers).
+        extra_cc = list(requester.get("cc_dispatch_to", []))
+        to_lc = (email_data.get("to") or "").lower()
+        cc_lc = (email_data.get("cc") or "").lower()
+        for raddr, rcfg in requesters.items():
+            if raddr != sender_email and rcfg.get("tier") == "member_services":
+                if raddr in to_lc or raddr in cc_lc:
+                    if raddr not in [e.lower() for e in extra_cc]:
+                        extra_cc.append(raddr)
 
-    # Cost threshold check
-    cost_threshold = greg_cfg.get("cost_threshold_usd", 100)
-    if cost_usd is not None and cost_usd > cost_threshold:
-        return _escalate_to_mike(
-            f"Cost ${cost_usd} exceeds threshold ${cost_threshold}",
-            classification,
-        )
+    else:
+        # member_services tier
+        if category in ("off_site_research", "ambiguous"):
+            return _escalate(f"Category '{category}' requires review", classification)
 
-    # auto_dispatch gate
-    auto_dispatch = greg_cfg.get("auto_dispatch", False)
-    if not auto_dispatch:
-        return _escalate_to_mike(
-            "auto_dispatch is disabled — routing to Mike for manual approval",
-            classification,
-        )
+        cost_threshold = requester.get("cost_threshold_usd", 100)
+        if cost_threshold is not None and cost_usd is not None and cost_usd > cost_threshold:
+            return _escalate(
+                f"Cost ${cost_usd} exceeds threshold ${cost_threshold}", classification
+            )
 
-    # AUTO-DISPATCH path
-    task_name_raw = email_data.get("subject", "greg-legends-task")
-    task_name = re.sub(r'[^\w\-]', '-', task_name_raw).strip('-') or 'greg-task'
+        auto_dispatch = requester.get("auto_dispatch", False)
+        if not auto_dispatch:
+            return _escalate(
+                "auto_dispatch is disabled — routing for manual approval", classification
+            )
+
+        extra_cc = list(requester.get("cc_dispatch_to", []))
+
+    # ----------------------------------------------------------------
+    # AUTO-DISPATCH path (reached when all gates pass)
+    # ----------------------------------------------------------------
+    task_name_raw = email_data.get("subject", "task")
+    task_name = re.sub(r'[^\w\-]', '-', task_name_raw).strip('-') or 'task'
     task_name = task_name[:40]
     audit_path = f"~/Projects/SOMA/audits/{iso_now}-{task_name}.md"
 
     prompt = (
         "## Context\n"
-        f"Email from Greg Foster ({greg_email_addr}), Legends Member Services Committee.\n"
+        f"Email from {req_name} ({sender_email}).\n"
         f"Subject: {email_data.get('subject', '')}\n\n"
         f"## Email Body\n{email_data.get('body', '')}\n\n"
         "## Task\n"
-        f"Handle this Legends website work request from Greg. "
-        f"Category: {category}. "
+        f"Handle this work request. Category: {category}. "
         "Complete the requested work and report back.\n\n"
         "## Done criteria\n"
         f"Changes complete, tested, and a summary written to {audit_path}"
     )
 
     dispatch_result = {
-        "type": "greg_dispatched",
+        "type": "trusted_dispatched",
+        "requester": req_name,
+        "tier": tier,
         "from": sender_raw,
         "sender_email": sender_email,
         "subject": email_data.get("subject", ""),
         "classification": classification,
         "task_name": task_name,
+        "extra_cc": extra_cc,
         "timestamp": datetime.now().isoformat(),
     }
 
@@ -1018,7 +1180,14 @@ def handle_greg_email(email_data, config, logger):
     if not os.path.exists(mac_cmd):
         logging.error(f"cc-dispatch not found at {mac_cmd}")
         dispatch_result["action_result"] = "error:cc-dispatch_not_found"
-        return _escalate_to_mike(f"cc-dispatch not found at {mac_cmd}", classification)
+        if tier == "owner":
+            return _surface_hard_stop(
+                {"category": "dispatch_error",
+                 "reason": f"cc-dispatch not found at {mac_cmd}",
+                 "summary": "cc-dispatch binary missing"},
+                "dispatch_error",
+            )
+        return _escalate(f"cc-dispatch not found at {mac_cmd}", classification)
 
     try:
         proc = subprocess.Popen(
@@ -1028,25 +1197,27 @@ def handle_greg_email(email_data, config, logger):
         )
         dispatch_result["dispatch_pid"] = proc.pid
         dispatch_result["action_result"] = "dispatched"
-        logging.info(f"[GREG/dispatch] task={task_name} pid={proc.pid}")
+        logging.info(f"[trusted/{req_name}] dispatch task={task_name} pid={proc.pid}")
     except Exception as e:
         dispatch_result["action_result"] = f"dispatch_error: {e}"
-        logging.error(f"Failed to dispatch Greg task: {e}")
-        return _escalate_to_mike(f"Dispatch failed: {e}", classification)
+        logging.error(f"[trusted/{req_name}] failed to dispatch: {e}")
+        if tier == "owner":
+            return _surface_hard_stop(
+                {"category": "dispatch_error", "reason": str(e),
+                 "summary": f"Dispatch failed: {e}"},
+                "dispatch_error",
+            )
+        return _escalate(f"Dispatch failed: {e}", classification)
 
-    # Reply to Greg + optionally CC Mike
+    # Ack to requester (CC any extra recipients)
     reply_body = (
-        f"Hi Greg,\n\n"
+        f"{ack_greeting}\n\n"
         f"I've received your request and started working on it.\n\n"
         f"Task: {task_name}\n"
         f"Report: {audit_path}\n\n"
         f"I'll follow up when complete.\n\n"
-        "Best,\nClaude\n(AI assistant for the Legends website)"
+        f"Best,\n{ack_signature}"
     )
-    cc_list = []
-    if greg_cfg.get("cc_mike_on_dispatch", True):
-        cc_list.append(forward_to)
-
     try:
         send_email(
             config,
@@ -1055,23 +1226,24 @@ def handle_greg_email(email_data, config, logger):
             reply_body,
             in_reply_to=email_data.get("message_id"),
             references=email_data.get("references"),
-            cc=cc_list if cc_list else None,
+            cc=extra_cc if extra_cc else None,
         )
         dispatch_result["reply_sent"] = True
     except Exception as e:
         dispatch_result["reply_sent"] = False
         dispatch_result["reply_error"] = str(e)
-        logging.error(f"Failed to send reply to Greg: {e}")
+        logging.error(f"[trusted/{req_name}] failed to send ack: {e}")
 
-    log_path = log_dir / f"greg-dispatched-{iso_now}.json"
+    log_path = log_dir / f"trusted-dispatched-{iso_now}.json"
     with open(log_path, "w") as f:
         json.dump(dispatch_result, f, indent=2)
 
-    # Register this task as pending completion notification
-    _save_greg_pending(config, {
+    # Register pending completion notification
+    _save_pending(config, {
         "task_name": task_name,
-        "greg_from": sender_raw,
-        "greg_email": sender_email,
+        "requester_from": sender_raw,
+        "requester_email": sender_email,
+        "extra_cc": extra_cc,
         "subject": email_data.get("subject", ""),
         "message_id": email_data.get("message_id", ""),
         "references": email_data.get("references", ""),
@@ -1080,6 +1252,10 @@ def handle_greg_email(email_data, config, logger):
     })
 
     return dispatch_result
+
+
+# Keep old name as an alias so external callers still work.
+handle_greg_email = handle_trusted_email
 
 
 # ---------------------------------------------------------------------------
@@ -1295,20 +1471,21 @@ def run_cycle(config, state, logger, dry_run=False):
                 state.mark_processed("inbox", em["stable_id"])
                 continue
 
-            # Greg pipeline: check before general LLM routing
-            greg_result = handle_greg_email(em, config, logger) if not dry_run else None
-            if greg_result is not None:
-                results.append(greg_result)
+            # Trusted-requester pipeline: check before general LLM routing
+            trusted_result = handle_trusted_email(em, config, logger) if not dry_run else None
+            if trusted_result is not None:
+                results.append(trusted_result)
                 state.mark_processed("inbox", em["stable_id"])
-                logging.info(f"  [greg/{greg_result.get('type', '?')}] {em['subject'][:60]}")
+                logging.info(f"  [trusted/{trusted_result.get('type', '?')}] {em['subject'][:60]}")
                 continue
-            if dry_run and config.get("greg_pipeline", {}).get("enabled"):
+            if dry_run:
+                _requesters = _get_trusted_requesters(config)
                 _from_raw = em.get("from", "")
                 _m = re.search(r'<([^>]+)>', _from_raw)
                 _sender = _m.group(1).strip().lower() if _m else _from_raw.strip().lower()
-                if _sender == config["greg_pipeline"].get("email", "").lower():
-                    logging.info(f"  [greg/dry-run] {em['subject'][:60]}")
-                    results.append({"action": "greg_dry_run", "subject": em["subject"]})
+                if _sender in _requesters:
+                    logging.info(f"  [trusted/dry-run] {em['subject'][:60]}")
+                    results.append({"action": "trusted_dry_run", "subject": em["subject"]})
                     state.mark_processed("inbox", em["stable_id"])
                     continue
 
@@ -1377,9 +1554,9 @@ def run_cycle(config, state, logger, dry_run=False):
     else:
         logging.debug("Skipping draft check — MIKE_EMAIL_PW not set")
 
-    # 3. Check Greg completions — send "done" emails when dispatched tasks land
+    # 3. Check pending completions — send "done" emails when dispatched tasks land
     if not dry_run:
-        check_greg_completions(config, logger)
+        check_pending_completions(config, logger)
 
     return results
 
