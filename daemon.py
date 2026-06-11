@@ -692,6 +692,180 @@ def classify_greg_email(config, email_data):
         }
 
 
+def _greg_pending_path(config):
+    return Path(os.path.expanduser(config["state_file"])).parent / "greg-pending.json"
+
+
+def _load_greg_pending(config):
+    path = _greg_pending_path(config)
+    if path.exists():
+        with open(path) as f:
+            return json.load(f)
+    return []
+
+
+def _save_greg_pending_list(config, tasks):
+    path = _greg_pending_path(config)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w") as f:
+        json.dump(tasks, f, indent=2)
+
+
+def _save_greg_pending(config, task):
+    tasks = _load_greg_pending(config)
+    tasks.append(task)
+    _save_greg_pending_list(config, tasks)
+
+
+def _extract_report_summary(report_text, max_chars=3000):
+    """Extract a human-readable summary from an audit report for the completion email."""
+    if not report_text:
+        return "(no report content)"
+    # Try to find a meaningful section: ## Result, ## What Was Done, ## Final assistant text
+    for section_header in ("## Result", "## What Was Done", "## Changes Made", "## Final assistant text"):
+        idx = report_text.find(section_header)
+        if idx != -1:
+            snippet = report_text[idx:idx + max_chars].strip()
+            # Trim at the next ## heading if it's long
+            next_section = snippet.find("\n## ", 3)
+            if next_section != -1 and next_section > 200:
+                snippet = snippet[:next_section].strip()
+            return snippet
+    # Fall back to first max_chars chars, skip the header line
+    lines = report_text.strip().splitlines()
+    body_lines = [l for l in lines if not l.startswith("# cc-dispatch report")]
+    return "\n".join(body_lines)[:max_chars].strip()
+
+
+def check_greg_completions(config, logger):
+    """
+    Check if any pending Greg tasks have completed (audit report appeared on disk).
+    Send completion emails when reports land; time out after completion_timeout_hours.
+    Called every daemon cycle.
+    """
+    greg_cfg = config.get("greg_pipeline", {})
+    if not greg_cfg.get("enabled", False):
+        return
+
+    pending = _load_greg_pending(config)
+    if not pending:
+        return
+
+    audits_dir = Path(os.path.expanduser("~/Projects/SOMA/audits"))
+    forward_to = config["forward_to"]
+    timeout_hours = greg_cfg.get("completion_timeout_hours", 4)
+    updated = False
+
+    for task in pending:
+        if task.get("notified"):
+            continue
+
+        task_name = task["task_name"]
+        dispatched_at = task.get("dispatched_at", "")
+        greg_from = task.get("greg_from", "")
+        subject = task.get("subject", "")
+
+        # Look for a matching report: *-{task_name}.md in audits dir
+        matching = sorted(audits_dir.glob(f"*-{task_name}.md"))
+
+        report_path = None
+        report_text = ""
+        if matching:
+            report_path = matching[-1]  # most recent match
+            try:
+                report_text = report_path.read_text(errors="replace")
+            except OSError as e:
+                logging.warning(f"[greg/completion] could not read report {report_path}: {e}")
+
+        # Check timeout
+        timed_out = False
+        if dispatched_at:
+            try:
+                dispatched_dt = datetime.fromisoformat(dispatched_at)
+                age_hours = (datetime.now() - dispatched_dt).total_seconds() / 3600
+                if age_hours > timeout_hours:
+                    timed_out = True
+            except ValueError:
+                pass
+
+        if report_path or timed_out:
+            # Compose completion email
+            if report_path and report_text:
+                summary = _extract_report_summary(report_text)
+                email_body = (
+                    f"Hi Greg,\n\n"
+                    f"Your request has been completed.\n\n"
+                    f"Task: {task_name}\n\n"
+                    f"---\n\n"
+                    f"{summary}\n\n"
+                    f"---\n\n"
+                    f"Full report: {report_path}\n\n"
+                    f"Best,\nClaude\n(AI assistant for the Legends website)"
+                )
+                email_subject = f"Re: {subject} — Done"
+                log_type = "greg_completion_sent"
+            else:
+                email_body = (
+                    f"Hi Greg,\n\n"
+                    f"Your request is taking longer than expected. "
+                    f"Mike has been notified and will follow up.\n\n"
+                    f"Task: {task_name}\n\n"
+                    f"Best,\nClaude\n(AI assistant for the Legends website)"
+                )
+                email_subject = f"Re: {subject} — In Progress"
+                log_type = "greg_completion_timeout"
+                # Also alert Mike
+                try:
+                    send_email(
+                        config,
+                        forward_to,
+                        f"[Greg/Legends] Task timeout: {task_name}",
+                        f"Greg task '{task_name}' has been pending for >{timeout_hours}h with no audit report.\n"
+                        f"Dispatched at: {dispatched_at}\n"
+                        f"Expected report in: {audits_dir}/*-{task_name}.md\n\n"
+                        f"Original request from: {greg_from}\nSubject: {subject}",
+                    )
+                except Exception as e:
+                    logging.error(f"[greg/completion] failed to alert Mike about timeout: {e}")
+
+            cc_list = [forward_to] if greg_cfg.get("cc_mike_on_dispatch", True) else []
+            try:
+                send_email(
+                    config,
+                    greg_from,
+                    email_subject,
+                    email_body,
+                    in_reply_to=task.get("message_id") or None,
+                    references=task.get("references") or None,
+                    cc=cc_list if cc_list else None,
+                )
+                task["notified"] = True
+                task["notified_at"] = datetime.now().isoformat()
+                task["report_path"] = str(report_path) if report_path else None
+                task["notify_type"] = log_type
+                updated = True
+                logging.info(f"[greg/completion] sent {log_type} for task={task_name} to {greg_from}")
+            except Exception as e:
+                logging.error(f"[greg/completion] failed to send completion email for task={task_name}: {e}")
+
+    if updated:
+        _save_greg_pending_list(config, pending)
+        # Prune fully-notified tasks older than 7 days
+        cutoff = datetime.now().timestamp() - 7 * 86400
+        pruned = []
+        for task in pending:
+            if task.get("notified"):
+                notified_at = task.get("notified_at", "")
+                try:
+                    if datetime.fromisoformat(notified_at).timestamp() < cutoff:
+                        continue  # drop old notified task
+                except ValueError:
+                    pass
+            pruned.append(task)
+        if len(pruned) != len(pending):
+            _save_greg_pending_list(config, pruned)
+
+
 def handle_greg_email(email_data, config, logger):
     """
     Handle emails from Greg Foster (Legends Member Services Committee).
@@ -892,6 +1066,18 @@ def handle_greg_email(email_data, config, logger):
     log_path = log_dir / f"greg-dispatched-{iso_now}.json"
     with open(log_path, "w") as f:
         json.dump(dispatch_result, f, indent=2)
+
+    # Register this task as pending completion notification
+    _save_greg_pending(config, {
+        "task_name": task_name,
+        "greg_from": sender_raw,
+        "greg_email": sender_email,
+        "subject": email_data.get("subject", ""),
+        "message_id": email_data.get("message_id", ""),
+        "references": email_data.get("references", ""),
+        "dispatched_at": datetime.now().isoformat(),
+        "notified": False,
+    })
 
     return dispatch_result
 
@@ -1190,6 +1376,10 @@ def run_cycle(config, state, logger, dry_run=False):
                 logging.error(f"Error checking Mike's drafts: {e}")
     else:
         logging.debug("Skipping draft check — MIKE_EMAIL_PW not set")
+
+    # 3. Check Greg completions — send "done" emails when dispatched tasks land
+    if not dry_run:
+        check_greg_completions(config, logger)
 
     return results
 

@@ -84,3 +84,5 @@ greg_pipeline:
   cc_mike_on_dispatch: true
   # Requests mentioning costs above this dollar amount go to Mike regardless of type
   cost_threshold_usd: 100
+  # Hours to wait for a task report before timing out and notifying Greg + Mike
+  completion_timeout_hours: 4
