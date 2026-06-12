@@ -100,8 +100,8 @@ trusted_requesters:
     site_description: "A membership site for the Legends of Basketball committee — member directory, event minutes, resources, and member services tools."
     repo: "~/Projects/legends-membership-site"
 
-  # FILL IN: replace __ERIC_EMAIL__ with Eric's real email address (one-line edit)
-  __ERIC_EMAIL__:
+  # FILL IN: replace eric@ekcosystem.com with Eric's real email address (one-line edit)
+  eric@ekcosystem.com:
     name: Eric
     tier: member_services
     auto_dispatch: true

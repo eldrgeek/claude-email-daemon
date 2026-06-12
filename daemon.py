@@ -1239,30 +1239,35 @@ def handle_trusted_email(email_data, config, logger):
             )
         return _escalate(f"Dispatch failed: {e}", classification)
 
-    # Ack to requester (CC any extra recipients)
-    reply_body = (
-        f"{ack_greeting}\n\n"
-        f"I've received your request and started working on it.\n\n"
-        f"Task: {task_name}\n"
-        f"Report: {audit_path}\n\n"
-        f"I'll follow up when complete.\n\n"
-        f"Best,\n{ack_signature}"
-    )
-    try:
-        send_email(
-            config,
-            sender_raw,
-            f"Re: {email_data.get('subject', '')}",
-            reply_body,
-            in_reply_to=email_data.get("message_id"),
-            references=email_data.get("references"),
-            cc=extra_cc if extra_cc else None,
+    # Ack to requester — gated. Default: NO separate ack; the single completion
+    # email carries the explanation + summary. Set send_ack: true per requester to restore.
+    if requester.get("send_ack", False):
+        reply_body = (
+            f"{ack_greeting}\n\n"
+            f"I've received your request and started working on it.\n\n"
+            f"Task: {task_name}\n"
+            f"Report: {audit_path}\n\n"
+            f"I'll follow up when complete.\n\n"
+            f"Best,\n{ack_signature}"
         )
-        dispatch_result["reply_sent"] = True
-    except Exception as e:
+        try:
+            send_email(
+                config,
+                sender_raw,
+                f"Re: {email_data.get('subject', '')}",
+                reply_body,
+                in_reply_to=email_data.get("message_id"),
+                references=email_data.get("references"),
+                cc=extra_cc if extra_cc else None,
+            )
+            dispatch_result["reply_sent"] = True
+        except Exception as e:
+            dispatch_result["reply_sent"] = False
+            dispatch_result["reply_error"] = str(e)
+            logging.error(f"[trusted/{req_name}] failed to send ack: {e}")
+    else:
         dispatch_result["reply_sent"] = False
-        dispatch_result["reply_error"] = str(e)
-        logging.error(f"[trusted/{req_name}] failed to send ack: {e}")
+        dispatch_result["ack_skipped"] = True
 
     log_path = log_dir / f"trusted-dispatched-{iso_now}.json"
     with open(log_path, "w") as f:
