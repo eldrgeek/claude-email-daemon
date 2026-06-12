@@ -96,6 +96,25 @@ trusted_requesters:
     escalate_to: mw@mike-wolf.com
     ack_greeting: "Hi Greg,"
     ack_signature: "Claude\n(AI assistant for the Legends website)"
+    site_label: "the Legends website"
+    site_description: "A membership site for the Legends of Basketball committee — member directory, event minutes, resources, and member services tools."
+    repo: "~/Projects/legends-membership-site"
+
+  # FILL IN: replace __ERIC_EMAIL__ with Eric's real email address (one-line edit)
+  __ERIC_EMAIL__:
+    name: Eric
+    tier: member_services
+    auto_dispatch: true
+    cc_dispatch_to:
+      - mw@mike-wolf.com
+    cost_threshold_usd: 100
+    completion_timeout_hours: 4
+    escalate_to: mw@mike-wolf.com
+    ack_greeting: "Hi Eric,"
+    ack_signature: "Claude\n(AI assistant for Witness Projection)"
+    site_label: "the Witness Projection / Izzy site"
+    site_description: "Izzy is the AI dramaturge and life coach collaborator for Eric's play Witness Projection — an AI chat interface with RAG knowledge retrieval, TTS voice, working document, and session history."
+    repo: "~/Projects/SOMA/services/izzy-chat"
 
   mw@mike-wolf.com:
     name: Mike Wolf

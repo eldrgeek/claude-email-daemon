@@ -618,26 +618,29 @@ def send_email(config, to, subject, body, in_reply_to=None, references=None, cc=
 
 
 # ---------------------------------------------------------------------------
-# Greg Foster pipeline — autonomous Legends Member Services email handling
+# Trusted-requester pipeline — autonomous email handling for site requesters
 # ---------------------------------------------------------------------------
 
-GREG_CLASSIFY_PROMPT = """You are classifying an email from Greg Foster (Legends Member Services Committee) to determine safe routing.
-
-Classify into exactly one category. Respond with valid JSON only.
-
-Categories:
-- "on_site_build": Request to build, modify, or fix something on the Legends website
-- "proposal_with_cost": Request that explicitly mentions a cost or budget amount
-- "off_site_research": Research, data gathering, or work not directly on the Legends website
-- "destructive": Requests to delete, drop, wipe, remove, or irreversibly change data or systems
-- "access_control": Requests about passwords, credentials, permissions, or account access
-- "ambiguous": Unclear intent, insufficient context, or multiple conflicting categories
-
-Extract any explicitly mentioned dollar amounts.
-
-Respond ONLY with JSON:
-{"category": "<category>", "reason": "<one sentence>", "cost_usd": <number or null>, "summary": "<2-3 sentence summary>"}
-"""
+def _build_classify_prompt(requester):
+    """Build a per-requester classifier prompt from their config fields."""
+    req_name   = requester.get("name", "the requester")
+    site_label = requester.get("site_label", "the website")
+    site_desc  = requester.get("site_description", "")
+    desc_clause = f"\n{site_desc}" if site_desc else ""
+    return (
+        f"You are classifying an email from {req_name} to determine safe routing.{desc_clause}\n\n"
+        "Classify into exactly one category. Respond with valid JSON only.\n\n"
+        "Categories:\n"
+        f'- "on_site_build": Request to build, modify, or fix something on {site_label}\n'
+        '- "proposal_with_cost": Request that explicitly mentions a cost or budget amount\n'
+        f'- "off_site_research": Research, data gathering, or work not directly on {site_label}\n'
+        '- "destructive": Requests to delete, drop, wipe, remove, or irreversibly change data or systems\n'
+        '- "access_control": Requests about passwords, credentials, permissions, or account access\n'
+        '- "ambiguous": Unclear intent, insufficient context, or multiple conflicting categories\n\n'
+        "Extract any explicitly mentioned dollar amounts.\n\n"
+        "Respond ONLY with JSON:\n"
+        '{"category": "<category>", "reason": "<one sentence>", "cost_usd": <number or null>, "summary": "<2-3 sentence summary>"}'
+    )
 
 
 def _check_dkim_spf(email_data):
@@ -667,11 +670,11 @@ def _parse_classify_json(raw):
     return json.loads(json_str.strip())
 
 
-def _classify_via_vps_fallback(email_text):
-    """Classify Greg email via VPS Haiku endpoint. Returns classification dict or raises."""
+def _classify_via_vps_fallback(classify_prompt, email_text):
+    """Classify email via VPS Haiku endpoint. Returns classification dict or raises."""
     vps_url = "https://vpsmikewolf.duckdns.org/infer/ask"
     question = (
-        GREG_CLASSIFY_PROMPT
+        classify_prompt
         + "\n\nEmail:\n" + email_text
         + "\n\nRespond with valid JSON only — no other text."
     )
@@ -682,18 +685,19 @@ def _classify_via_vps_fallback(email_text):
     return result
 
 
-def classify_greg_email(config, email_data):
-    """Ask the local LLM to classify a Greg email. Falls back to VPS Haiku if Ollama is down."""
+def classify_trusted_email(config, email_data, requester):
+    """Ask the local LLM to classify a trusted-requester email. Falls back to VPS Haiku if Ollama is down."""
     llm = config["llm"]
     email_text = (
         f"Subject: {email_data.get('subject', '')}\n\n"
         f"Body: {email_data.get('body', '')}"
     )
+    classify_prompt = _build_classify_prompt(requester)
     ollama_error = None
     try:
         resp = requests.post(llm["endpoint"], json={
             "model": llm["model"],
-            "prompt": f"{GREG_CLASSIFY_PROMPT}\n\nEmail:\n{email_text}",
+            "prompt": f"{classify_prompt}\n\nEmail:\n{email_text}",
             "stream": False,
             "options": {
                 "temperature": llm.get("temperature", 0.1),
@@ -709,7 +713,7 @@ def classify_greg_email(config, email_data):
         logging.warning(f"Ollama classifier failed ({e}), trying VPS fallback")
 
     try:
-        return _classify_via_vps_fallback(email_text)
+        return _classify_via_vps_fallback(classify_prompt, email_text)
     except Exception as e2:
         logging.error(f"VPS fallback classifier also failed: {e2}")
         return {
@@ -720,6 +724,18 @@ def classify_greg_email(config, email_data):
             "error": str(e2),
             "classifier": "none",
         }
+
+
+def classify_greg_email(config, email_data):
+    """Backward-compat alias — classifies using Greg's site context from trusted_requesters."""
+    requesters = _get_trusted_requesters(config)
+    greg_cfg = config.get("greg_pipeline", {})
+    greg_addr = greg_cfg.get("email", "").lower().strip() if greg_cfg else ""
+    requester = requesters.get(greg_addr) or {
+        "name": "Greg Foster",
+        "site_label": "the Legends website",
+    }
+    return classify_trusted_email(config, email_data, requester)
 
 
 def _pending_path(config):
@@ -1082,7 +1098,7 @@ def handle_trusted_email(email_data, config, logger):
     # ----------------------------------------------------------------
     # Classify the email
     # ----------------------------------------------------------------
-    classification = classify_greg_email(config, email_data)
+    classification = classify_trusted_email(config, email_data, requester)
     category = classification.get("category", "ambiguous")
     cost_usd = classification.get("cost_usd")
 
@@ -1159,6 +1175,13 @@ def handle_trusted_email(email_data, config, logger):
         f"Changes complete, tested, and a summary written to {audit_path}"
     )
 
+    # Resolve repo workdir for this requester (used as --workdir arg to cc-dispatch)
+    repo_raw = requester.get("repo")
+    repo_path = os.path.expanduser(repo_raw) if repo_raw else None
+    if repo_path and not os.path.isdir(repo_path):
+        logging.warning(f"[trusted/{req_name}] repo path not found: {repo_path} — dispatching without workdir")
+        repo_path = None
+
     dispatch_result = {
         "type": "trusted_dispatched",
         "requester": req_name,
@@ -1169,6 +1192,7 @@ def handle_trusted_email(email_data, config, logger):
         "classification": classification,
         "task_name": task_name,
         "extra_cc": extra_cc,
+        "repo": repo_path,
         "timestamp": datetime.now().isoformat(),
     }
 
@@ -1190,14 +1214,20 @@ def handle_trusted_email(email_data, config, logger):
         return _escalate(f"cc-dispatch not found at {mac_cmd}", classification)
 
     try:
+        cmd_args = [mac_cmd]
+        if repo_path:
+            cmd_args += ["--workdir", repo_path]
+        cmd_args += [task_name, prompt]
+
         proc = subprocess.Popen(
-            [mac_cmd, task_name, prompt],
+            cmd_args,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
         )
         dispatch_result["dispatch_pid"] = proc.pid
         dispatch_result["action_result"] = "dispatched"
-        logging.info(f"[trusted/{req_name}] dispatch task={task_name} pid={proc.pid}")
+        repo_note = f" workdir={repo_path}" if repo_path else ""
+        logging.info(f"[trusted/{req_name}] dispatch task={task_name} pid={proc.pid}{repo_note}")
     except Exception as e:
         dispatch_result["action_result"] = f"dispatch_error: {e}"
         logging.error(f"[trusted/{req_name}] failed to dispatch: {e}")
