@@ -27,6 +27,20 @@ llm:
   temperature: 0.1
   max_tokens: 200
 
+# --- Second opinion (borderline-case adjudicator) ---
+# When the fast first-pass classifier flags a trusted-requester email as
+# 'destructive' or 'ambiguous', a stronger reasoning model re-judges it on
+# REVERSIBILITY and blast radius before we hard-stop or escalate. Reversible
+# content edits (e.g. removing a section that's duplicated on another page) are
+# reclassified to on_site_build and proceed; only irreversible, high-blast-radius
+# work (dropping a database, deleting all records/backups) stays a hard stop.
+# Runs via the local `claude` CLI (Claude Code subscription) — the same binary
+# cc-dispatch uses. If it's unreachable, the conservative first-pass call stands.
+second_opinion:
+  enabled: true
+  model: opus            # claude CLI alias; resolves to current Opus (4.8-class)
+  timeout_seconds: 120
+
 # --- Draft protocol ---
 # Drafts in Mike's Gmail with this subject prefix are treated as
 # instructions from Claude Web/Mobile
@@ -81,6 +95,11 @@ dispatch:
 #                      hard stops (destructive, access_control) are surfaced as manual-action notices
 #
 # HARD STOPS (all tiers): destructive, access_control — NEVER auto-executed.
+# "destructive" means IRREVERSIBLE / high-blast-radius (dropping a database,
+# deleting all records or backups, deleting the whole site/repo) — NOT ordinary
+# content removals, which are git-revertable and route to on_site_build. Borderline
+# 'destructive'/'ambiguous' calls get a stronger-model second opinion (see
+# second_opinion above) before any hard stop.
 #
 trusted_requesters:
   gfos44@gmail.com:

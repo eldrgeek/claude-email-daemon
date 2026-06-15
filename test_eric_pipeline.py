@@ -126,6 +126,7 @@ class TestEricEmailRouting(unittest.TestCase):
         """Run handle_trusted_email with a mocked classifier and no real I/O."""
         mock_result = self._classify_mock(classification_category, cost_usd)
         with patch("daemon.classify_trusted_email", return_value=mock_result), \
+             patch("daemon._second_opinion", return_value=None), \
              patch("daemon.send_email") as mock_send, \
              patch("daemon.subprocess.Popen") as mock_popen, \
              patch("daemon._save_pending"):

@@ -19,6 +19,7 @@ import json
 import os
 import re
 import shlex
+import shutil
 import subprocess
 import sys
 import time
@@ -622,24 +623,42 @@ def send_email(config, to, subject, body, in_reply_to=None, references=None, cc=
 # ---------------------------------------------------------------------------
 
 def _build_classify_prompt(requester):
-    """Build a per-requester classifier prompt from their config fields."""
+    """Build a per-requester classifier prompt from their config fields.
+
+    The classifier triages on REVERSIBILITY and blast radius — NOT on whether the
+    email happens to contain words like "delete" or "remove". The site's content
+    lives in version control (git) and is deployed via Netlify, so ordinary content
+    edits — even ones that remove a section, page, or block — can be reverted in one
+    step and are therefore NOT destructive. The "destructive" category is reserved
+    for genuinely irreversible, high-blast-radius operations with no easy undo.
+    """
     req_name   = requester.get("name", "the requester")
     site_label = requester.get("site_label", "the website")
     site_desc  = requester.get("site_description", "")
     desc_clause = f"\n{site_desc}" if site_desc else ""
     return (
         f"You are classifying an email from {req_name} to determine safe routing.{desc_clause}\n\n"
+        f"{site_label} is kept in version control (git) and deployed via Netlify, so any change "
+        "to page content can be reverted with a single step. Judge each request by whether it is "
+        "REVERSIBLE and by its blast radius — do NOT classify something as destructive merely "
+        "because it contains a word like 'delete', 'remove', or 'drop'.\n\n"
         "Classify into exactly one category. Respond with valid JSON only.\n\n"
         "Categories:\n"
-        f'- "on_site_build": Request to build, modify, or fix something on {site_label}\n'
+        f'- "on_site_build": Build, modify, fix, OR remove content on {site_label}. This INCLUDES '
+        "deleting, removing, hiding, or reordering a section, page, block, image, or text — those "
+        "are reversible content edits and belong here, not under 'destructive'.\n"
         '- "proposal_with_cost": Request that explicitly mentions a cost or budget amount\n'
         f'- "off_site_research": Research, data gathering, or work not directly on {site_label}\n'
-        '- "destructive": Requests to delete, drop, wipe, remove, or irreversibly change data or systems\n'
+        '- "destructive": ONLY irreversible, high-blast-radius operations with no easy undo — e.g. '
+        "dropping or wiping a database, deleting all records or every user account, deleting backups, "
+        "deleting the entire site or repository, bulk-erasing data, or a factory reset. A request to "
+        "remove ordinary page content is NOT destructive.\n"
         '- "access_control": Requests about passwords, credentials, permissions, or account access\n'
         '- "ambiguous": Unclear intent, insufficient context, or multiple conflicting categories\n\n'
         "Extract any explicitly mentioned dollar amounts.\n\n"
         "Respond ONLY with JSON:\n"
-        '{"category": "<category>", "reason": "<one sentence>", "cost_usd": <number or null>, "summary": "<2-3 sentence summary>"}'
+        '{"category": "<category>", "reversible": <true|false>, "risk": "<low|medium|high>", '
+        '"reason": "<one sentence>", "cost_usd": <number or null>, "summary": "<2-3 sentence summary>"}'
     )
 
 
@@ -736,6 +755,98 @@ def classify_greg_email(config, email_data):
         "site_label": "the Legends website",
     }
     return classify_trusted_email(config, email_data, requester)
+
+
+def _resolve_claude_bin():
+    """Locate the Claude Code CLI the same way cc-dispatch's runner does."""
+    override = os.environ.get("CC_DISPATCH_CLAUDE_BIN")
+    if override:
+        return override
+    for p in [Path.home() / ".local/bin/claude", Path("/opt/homebrew/bin/claude")]:
+        if p.exists():
+            return str(p)
+    return shutil.which("claude") or "claude"
+
+
+def _second_opinion(config, email_data, requester, first_pass):
+    """Borderline-case adjudicator — a stronger model rules on reversibility.
+
+    The fast first-pass classifier (local Ollama / VPS Haiku) is deliberately
+    cautious. Before we hard-stop a 'destructive' request or bounce an 'ambiguous'
+    one back to a human, we ask a stronger reasoning model (default: Opus, via the
+    local `claude` CLI — the same binary cc-dispatch uses) to judge whether the
+    requested action is REVERSIBLE and its blast radius.
+
+    Returns a refined classification dict, or None when the second opinion is
+    disabled or unavailable — in which case the caller keeps the conservative
+    first-pass decision (fail safe, not fail open).
+    """
+    cfg = config.get("second_opinion", {}) or {}
+    if not cfg.get("enabled", True):
+        return None
+    model = cfg.get("model", "opus")
+    timeout = cfg.get("timeout_seconds", 120)
+
+    site_label = requester.get("site_label", "the website")
+    rubric = (
+        "You are the senior reviewer for an automated website-maintenance assistant.\n"
+        f"A fast first-pass classifier flagged the email below as '{first_pass.get('category')}'.\n"
+        f"{site_label} is kept in version control (git) and deployed via Netlify, so any change "
+        "to page content can be reverted with a single step.\n\n"
+        "Decide whether the requested action is REVERSIBLE and what its blast radius is, so we "
+        "know whether it is safe to auto-execute or must be escalated to a human.\n\n"
+        "SAFE to auto-execute -> category 'on_site_build': any change captured in version control "
+        "— editing, adding, removing, hiding, or reordering a section, page, block, image, or text "
+        "— even when the request literally says 'delete' or 'remove'.\n\n"
+        "ESCALATE (NOT safe to auto-execute): irreversible or high-blast-radius actions with no "
+        "easy undo — dropping or wiping a database, deleting all records or every user account, "
+        "deleting backups, deleting the entire repository or site, bulk-erasing data, changing "
+        "credentials / permissions / access, or moving money.\n\n"
+        "If — and ONLY if — you conclude the request is genuinely 'ambiguous', do not guess "
+        "silently. Spell out the confusion so the requester can resolve it in a single reply: "
+        "set 'confusion' to exactly what is unclear or missing, 'assumptions' to the most "
+        "reasonable working assumptions you would make, and 'interpretation' to the concrete "
+        "task you would carry out under those assumptions. Leave those three fields as empty "
+        "strings for any non-ambiguous category.\n\n"
+        "Respond with STRICT JSON only, no other text:\n"
+        '{"category": "on_site_build|destructive|access_control|off_site_research|ambiguous", '
+        '"reversible": true|false, "risk": "low|medium|high", "reason": "<one sentence>", '
+        '"summary": "<2-3 sentences>", "confusion": "<if ambiguous: what is unclear, else \\"\\">", '
+        '"assumptions": "<if ambiguous: your working assumptions, else \\"\\">", '
+        '"interpretation": "<if ambiguous: the task you would do under those assumptions, else \\"\\">"}'
+    )
+    email_text = (
+        f"Subject: {email_data.get('subject', '')}\n\n"
+        f"Body: {email_data.get('body', '')}"
+    )
+    prompt = rubric + "\n\nEmail:\n" + email_text
+
+    claude_bin = _resolve_claude_bin()
+    try:
+        proc = subprocess.run(
+            [claude_bin, "-p", "--output-format", "json", "--model", model],
+            input=prompt,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+        if proc.returncode != 0:
+            logging.warning(
+                f"second_opinion: claude exited {proc.returncode}: {proc.stderr[:200]}"
+            )
+            return None
+        # `claude -p --output-format json` wraps the answer as {"result": "...", ...}
+        try:
+            outer = json.loads(proc.stdout.strip())
+            answer = outer.get("result", proc.stdout) if isinstance(outer, dict) else proc.stdout
+        except json.JSONDecodeError:
+            answer = proc.stdout
+        refined = _parse_classify_json(answer)
+        refined["classifier"] = f"second_opinion:{model}"
+        return refined
+    except Exception as e:
+        logging.warning(f"second_opinion unavailable ({e}); keeping first-pass classification")
+        return None
 
 
 def _pending_path(config):
@@ -948,16 +1059,36 @@ def handle_trusted_email(email_data, config, logger):
     Handle emails from trusted requesters (configured in trusted_requesters).
     Returns a routing result dict, or None if the sender is not a trusted requester.
 
+    Classification is two-stage: a fast first-pass classifier (local Ollama / VPS
+    Haiku), then — only for borderline 'destructive' or 'ambiguous' calls — a
+    stronger-model SECOND OPINION (_second_opinion) that re-judges the request on
+    reversibility and blast radius. Reversible content edits (e.g. removing a
+    duplicated section, which git can revert) are reclassified to on_site_build and
+    proceed; only genuinely irreversible, high-blast-radius work stays a hard stop.
+    If the second opinion is unavailable, the conservative first-pass call stands.
+
+    AMBIGUOUS requests (all tiers) are never guessed at: the stronger model
+    articulates what's unclear, what it would assume, and what it would do under
+    those assumptions, and that is sent to the REQUESTER (manager CC'd) as a
+    clarification they can confirm or correct in a one-line reply — instead of a
+    bare "requires review" bounce to a manager.
+
     Tiers:
       member_services (e.g. Greg Foster)
         - Auto-dispatch: on_site_build, proposal_with_cost under cost_threshold_usd
+        - Clarify with requester: ambiguous
         - Escalate to escalate_to: destructive, access_control, off_site_research,
-          ambiguous, over-threshold costs, auto_dispatch=false
+          over-threshold costs, auto_dispatch=false
       owner (e.g. Mike Wolf)
-        - Auto-dispatch: ALL categories EXCEPT hard stops
+        - Auto-dispatch: ALL categories EXCEPT hard stops and ambiguous
+        - Clarify with owner: ambiguous (asked rather than guessed)
         - No cost cap; no escalation path (owner is self)
         - Hard stops (destructive, access_control) are SURFACED to the owner as a
           manual-action notice — never auto-executed regardless of tier
+
+    HARD STOPS reflect IRREVERSIBILITY, not the presence of words like "delete":
+    irreversible data loss (dropping a database, deleting all records/backups) and
+    access-control / money movement are never auto-executed regardless of tier.
 
     SENDER VERIFICATION:
       - owner tier: explicit DKIM/SPF fail → fall through to normal routing (return None)
@@ -1080,6 +1211,71 @@ def handle_trusted_email(email_data, config, logger):
         logging.info(f"[trusted/{req_name}] hard stop surfaced: {category}")
         return result
 
+    def _request_clarification(classification):
+        """Ask the requester to confirm or correct, rather than guessing or silently
+        bouncing the request to a manager.
+
+        For genuinely ambiguous requests, the stronger model has already articulated
+        what's unclear, what it would assume, and what it would do under those
+        assumptions. We relay that to the requester and invite a one-line reply —
+        which the daemon will pick up on the next poll and re-route. The manager
+        (escalate_to) is CC'd for visibility but doesn't have to act.
+        """
+        confusion       = (classification.get("confusion") or "").strip()
+        assumptions     = (classification.get("assumptions") or "").strip()
+        interpretation  = (classification.get("interpretation") or "").strip()
+        summary         = (classification.get("summary") or "").strip()
+
+        subj = f"Re: {email_data.get('subject', '')} — quick check before I start"
+        lines = [ack_greeting, "", "I want to make sure I get this right before I start."]
+        lines.append("")
+        lines += ["What's unclear:", confusion or summary or
+                  "I couldn't tell exactly what you'd like changed.", ""]
+        if assumptions:
+            lines += ["What I'm assuming:", assumptions, ""]
+        if interpretation:
+            lines += ["What I'd do based on that:", interpretation, ""]
+        lines += [
+            'If that\'s right, just reply "go ahead" and I\'ll take care of it.',
+            "If not, reply with the correction and I'll adjust.",
+            "",
+            f"—{ack_signature}",
+        ]
+
+        cc = list(requester.get("cc_dispatch_to", []))
+        escalate_to = requester.get("escalate_to")
+        if (escalate_to and escalate_to.lower() != sender_email
+                and escalate_to.lower() not in [c.lower() for c in cc]):
+            cc.append(escalate_to)
+
+        result = {
+            "type": "trusted_clarification",
+            "requester": req_name,
+            "tier": tier,
+            "from": sender_raw,
+            "sender_email": sender_email,
+            "subject": email_data.get("subject", ""),
+            "classification": classification,
+            "cc": cc,
+            "timestamp": datetime.now().isoformat(),
+        }
+        try:
+            send_email(
+                config, sender_raw, subj, "\n".join(lines),
+                in_reply_to=email_data.get("message_id"),
+                references=email_data.get("references"),
+                cc=cc if cc else None,
+            )
+            result["action_result"] = "clarification_sent"
+        except Exception as e:
+            result["action_result"] = f"clarification_send_error: {e}"
+            logging.error(f"[trusted/{req_name}] failed to send clarification: {e}")
+        log_path = log_dir / f"trusted-clarification-{iso_now}.json"
+        with open(log_path, "w") as f:
+            json.dump(result, f, indent=2)
+        logging.info(f"[trusted/{req_name}] clarification requested")
+        return result
+
     # ----------------------------------------------------------------
     # SENDER VERIFICATION: explicit DKIM/SPF failure
     # ----------------------------------------------------------------
@@ -1103,6 +1299,35 @@ def handle_trusted_email(email_data, config, logger):
     cost_usd = classification.get("cost_usd")
 
     # ----------------------------------------------------------------
+    # SECOND OPINION — borderline first-pass calls get a stronger model
+    # ----------------------------------------------------------------
+    # The fast classifier is tuned to be cautious, so it tends to over-flag any
+    # email containing words like "delete" or "remove" as destructive. Before we
+    # hard-stop such a request — or bounce an 'ambiguous' one to a human — ask a
+    # stronger reasoning model to rule on reversibility and blast radius. Reversible
+    # content edits (e.g. "remove the duplicated section") get reclassified to
+    # on_site_build and proceed; only genuinely irreversible work is stopped.
+    if category in ("destructive", "ambiguous"):
+        refined = _second_opinion(config, email_data, requester, classification)
+        if refined:
+            classification["first_pass"] = {
+                "category": category,
+                "classifier": classification.get("classifier"),
+            }
+            classification.update({k: v for k, v in refined.items() if k != "cost_usd"})
+            category = classification.get("category", category)
+            # Safety belt: never auto-run something the reviewer marked irreversible,
+            # even if it labeled the category as a benign one.
+            if refined.get("reversible") is False and category not in ("destructive", "access_control"):
+                category = "destructive"
+                classification["category"] = "destructive"
+            logging.info(
+                f"[trusted/{req_name}] second opinion: "
+                f"{classification['first_pass']['category']} -> {category} "
+                f"(reversible={refined.get('reversible')}, risk={refined.get('risk')})"
+            )
+
+    # ----------------------------------------------------------------
     # HARD STOPS — apply to ALL tiers, including owner
     # ----------------------------------------------------------------
     if category in ("destructive", "access_control"):
@@ -1112,6 +1337,14 @@ def handle_trusted_email(email_data, config, logger):
             f"Safety guard: '{category}' requests require manual approval",
             classification,
         )
+
+    # ----------------------------------------------------------------
+    # AMBIGUOUS — never guess, and never bounce a bare "requires review" to a
+    # manager. The stronger model has spelled out the confusion + assumptions;
+    # relay that to the requester (CC the manager) so a one-line reply resolves it.
+    # ----------------------------------------------------------------
+    if category == "ambiguous":
+        return _request_clarification(classification)
 
     # ----------------------------------------------------------------
     # Tier-specific routing
@@ -1138,7 +1371,8 @@ def handle_trusted_email(email_data, config, logger):
 
     else:
         # member_services tier
-        if category in ("off_site_research", "ambiguous"):
+        # (ambiguous is handled above via _request_clarification, for all tiers)
+        if category == "off_site_research":
             return _escalate(f"Category '{category}' requires review", classification)
 
         cost_threshold = requester.get("cost_threshold_usd", 100)

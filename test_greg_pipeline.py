@@ -149,9 +149,36 @@ CASE_D_DKIM_FAIL = _make_email(
     auth_results="dkim=fail header.d=gmail.com; spf=pass",
 )
 
-CASE_E_DESTRUCTIVE = _make_email(
-    subject="Delete all old event posts",
-    body="Please delete all event posts from before 2024 from the website.",
+# E: Greg's real case — remove a section that's duplicated on another page.
+# First-pass flags it 'destructive' (the word "remove"); the second opinion
+# recognizes it as a reversible, git-revertable content edit -> on_site_build -> dispatch.
+CASE_E_REVERSIBLE_REMOVE = _make_email(
+    subject="Remove duplicate Bylaws section from the About page",
+    body=(
+        "Hi Claude,\n\n"
+        "Please remove the Bylaws section from the About page — it already appears "
+        "in full on the Resources page, so right now it's duplicated.\n\n"
+        "Thanks, Greg"
+    ),
+)
+
+# M: Greg sends a genuinely irreversible request — the second opinion confirms
+# 'destructive' (it hits the database), so member_services escalates as before.
+CASE_M_DESTRUCTIVE_DB = _make_email(
+    subject="Wipe the member database",
+    body="Please delete all member records from the database and start fresh.",
+)
+
+# N: Greg sends a vague request — stays 'ambiguous' through the second opinion,
+# so a clarification (with assumptions) goes back to Greg, CC the manager.
+CASE_N_AMBIGUOUS = _make_email(
+    subject="Quick favor",
+    body=(
+        "Hi Claude,\n\n"
+        "Can you take care of the thing we talked about at the meeting? "
+        "You know the one.\n\n"
+        "Thanks, Greg"
+    ),
 )
 
 CASE_F_HIGH_COST = _make_email(
@@ -212,38 +239,82 @@ CASE_K_MIKE_DKIM_FAIL = _make_mike_email(
     dkim_fail=True,
 )
 
+# O: Mike (owner) sends a vague request — owner no longer auto-dispatches ambiguous;
+# it asks for clarification rather than guessing.
+CASE_O_MIKE_AMBIGUOUS = _make_mike_email(
+    subject="thoughts?",
+    body="Hey Claude, what about the thing from earlier? Let's just go with it.",
+)
+
 
 # ---------------------------------------------------------------------------
 # LLM mock: classify based on keywords so tests run without Ollama
 # ---------------------------------------------------------------------------
 
-def _mock_classify(config, email_data):
-    """Keyword-based classifier stub — no real LLM needed."""
+def _mock_first_pass(config, email_data, requester):
+    """Fast first-pass classifier stub — mirrors the cautious small model.
+
+    Deliberately over-flags ANY delete/remove/drop verb as 'destructive' (just like
+    qwen/Haiku does), so the second-opinion path is what rescues reversible edits.
+    Signature matches daemon.classify_trusted_email(config, email_data, requester).
+    """
     body = email_data.get("body", "").lower()
     subject = email_data.get("subject", "").lower()
     text = subject + " " + body
 
-    if any(w in text for w in ("delete", "drop", "wipe", "remove all", "destroy")):
+    if any(w in text for w in ("delete", "drop", "wipe", "remove", "destroy", "erase")):
         return {"category": "destructive", "reason": "Destructive keyword", "cost_usd": None,
-                "summary": "Wants to delete content."}
+                "summary": "Mentions deleting/removing something.", "classifier": "mock_first_pass"}
     if any(w in text for w in ("password", "credential", "access", "permission", "login")):
         return {"category": "access_control", "reason": "Access keyword", "cost_usd": None,
-                "summary": "Mentions access control."}
+                "summary": "Mentions access control.", "classifier": "mock_first_pass"}
     if any(w in text for w in ("research", "compare", "report", "competing", "analysis")):
         return {"category": "off_site_research", "reason": "Research keyword", "cost_usd": None,
-                "summary": "Research request."}
+                "summary": "Research request.", "classifier": "mock_first_pass"}
     if "$" in text or "budget" in text or "cost" in text or "redesign" in text:
-        # extract a dollar amount
         import re
         m = re.search(r'\$(\d+)', text)
         cost = int(m.group(1)) if m else None
         return {"category": "proposal_with_cost", "reason": "Cost mentioned", "cost_usd": cost,
-                "summary": "Proposal with cost."}
+                "summary": "Proposal with cost.", "classifier": "mock_first_pass"}
     if any(w in text for w in ("update", "add", "fix", "build", "create", "page", "website", "site")):
         return {"category": "on_site_build", "reason": "On-site work", "cost_usd": None,
-                "summary": "On-site website work request."}
+                "summary": "On-site website work request.", "classifier": "mock_first_pass"}
     return {"category": "ambiguous", "reason": "No clear category", "cost_usd": None,
-            "summary": "Unclear request."}
+            "summary": "Unclear request.", "classifier": "mock_first_pass"}
+
+
+def _mock_second_opinion(config, email_data, requester, first_pass):
+    """Stronger-model adjudicator stub — rules on reversibility/blast radius.
+
+    Mirrors the rubric in daemon._second_opinion WITHOUT spawning the real `claude`
+    CLI: anything that hits the database / records / backups / credentials is
+    irreversible -> stays destructive|access_control; everything else is a
+    reversible (git-revertable) content edit -> on_site_build.
+    """
+    text = (email_data.get("subject", "") + " " + email_data.get("body", "")).lower()
+    if any(w in text for w in ("database", "all member records", "all records",
+                                "every user", "backup", "drop ", "wipe")):
+        return {"category": "destructive", "reversible": False, "risk": "high",
+                "reason": "Irreversible data loss", "summary": "Targets the database / records / backups.",
+                "classifier": "second_opinion:mock"}
+    if any(w in text for w in ("password", "credential", "admin access", "permission")):
+        return {"category": "access_control", "reversible": False, "risk": "high",
+                "reason": "Access-control change", "summary": "Touches credentials / access.",
+                "classifier": "second_opinion:mock"}
+    if first_pass.get("category") == "ambiguous":
+        # Couldn't resolve it — articulate the confusion + assumptions for the requester.
+        return {"category": "ambiguous", "reversible": True, "risk": "low",
+                "reason": "Intent unclear",
+                "summary": "The request references something not specified in the email.",
+                "confusion": "Your note refers to a change we discussed but doesn't say which "
+                             "page or what specific edit you'd like.",
+                "assumptions": "I'm assuming you mean the page we most recently talked about.",
+                "interpretation": "I would apply the edit we last discussed to that page.",
+                "classifier": "second_opinion:mock"}
+    return {"category": "on_site_build", "reversible": True, "risk": "low",
+            "reason": "Reversible content edit (git-revertable)",
+            "summary": "Ordinary page-content change.", "classifier": "second_opinion:mock"}
 
 
 # ---------------------------------------------------------------------------
@@ -275,6 +346,11 @@ def _print_result(case_id, description, email_data, expected_type, result, sent_
         elif rtype == "hard_stop_surfaced":
             print(f"  Hard stop: {result.get('hard_stop_category')}")
             print(f"  Surfaced to: {[e['to'] for e in sent_emails]}")
+        elif rtype == "trusted_clarification":
+            cls = result.get("classification", {})
+            print(f"  Sent to  : {[e['to'] + (' CC:' + str(e['cc']) if e.get('cc') else '') for e in sent_emails]}")
+            print(f"  Confusion: {cls.get('confusion', '')}")
+            print(f"  Assumes  : {cls.get('assumptions', '')}")
     return passed, {
         "case": case_id,
         "description": description,
@@ -302,7 +378,8 @@ def run_simulation():
 
     original_send = D.send_email
     original_popen = __import__("subprocess").Popen
-    original_classify = D.classify_greg_email
+    original_classify = D.classify_trusted_email
+    original_second_opinion = D._second_opinion
 
     def mock_send(config, to, subject, body, **kwargs):
         sent_emails.append({"to": to, "subject": subject, "cc": kwargs.get("cc")})
@@ -315,7 +392,10 @@ def run_simulation():
         return m
 
     D.send_email = mock_send
-    D.classify_greg_email = _mock_classify
+    # Patch the function the handler actually calls (classify_trusted_email), and
+    # stub the second opinion so no real `claude` CLI is spawned during tests.
+    D.classify_trusted_email = _mock_first_pass
+    D._second_opinion = _mock_second_opinion
     __import__("subprocess").Popen = mock_popen
 
     all_passed = True
@@ -326,12 +406,14 @@ def run_simulation():
     # ----------------------------------------------------------------
     print("\n--- Greg (member_services tier) ---")
     GREG_CASES = [
-        ("A", CASE_A_ON_SITE,     "trusted_dispatched", "On-site build request from Greg"),
-        ("B", CASE_B_OFF_SITE,    "trusted_escalated",  "Off-site research → escalate to Mike"),
-        ("C", CASE_C_SPOOFED,     None,                 "Wrong sender — not Greg, falls through"),
-        ("D", CASE_D_DKIM_FAIL,   "trusted_escalated",  "DKIM fail → escalate (possible spoof)"),
-        ("E", CASE_E_DESTRUCTIVE, "trusted_escalated",  "Destructive → escalate (hard stop)"),
-        ("F", CASE_F_HIGH_COST,   "trusted_escalated",  "Cost over threshold → escalate"),
+        ("A", CASE_A_ON_SITE,          "trusted_dispatched", "On-site build request from Greg"),
+        ("B", CASE_B_OFF_SITE,         "trusted_escalated",  "Off-site research → escalate to Mike"),
+        ("C", CASE_C_SPOOFED,          None,                 "Wrong sender — not Greg, falls through"),
+        ("D", CASE_D_DKIM_FAIL,        "trusted_escalated",  "DKIM fail → escalate (possible spoof)"),
+        ("E", CASE_E_REVERSIBLE_REMOVE,"trusted_dispatched", "Reversible removal flagged destructive → 2nd opinion → dispatch"),
+        ("F", CASE_F_HIGH_COST,        "trusted_escalated",  "Cost over threshold → escalate"),
+        ("M", CASE_M_DESTRUCTIVE_DB,   "trusted_escalated",  "Irreversible DB wipe → 2nd opinion confirms → escalate"),
+        ("N", CASE_N_AMBIGUOUS,        "trusted_clarification", "Ambiguous → clarification to Greg (CC manager) with assumptions"),
     ]
     for case_id, email_data, expected_type, description in GREG_CASES:
         sent_emails.clear()
@@ -443,6 +525,24 @@ def run_simulation():
     all_passed = all_passed and passed_k
     results_log.append(log_k)
 
+    # O: Mike ambiguous → owner asks for clarification instead of auto-dispatching
+    sent_emails.clear()
+    dispatched_tasks.clear()
+    result_o = D.handle_trusted_email(CASE_O_MIKE_AMBIGUOUS, TEST_CONFIG, MagicMock())
+    passed_o, log_o = _print_result(
+        "O",
+        "Mike ambiguous → owner asks for clarification (no blind dispatch)",
+        CASE_O_MIKE_AMBIGUOUS,
+        "trusted_clarification",
+        result_o,
+        sent_emails,
+    )
+    if passed_o and dispatched_tasks:
+        print(f"  FAIL extra: dispatch was called for an ambiguous request! {dispatched_tasks}")
+        passed_o = False
+    all_passed = all_passed and passed_o
+    results_log.append(log_o)
+
     print("\n" + "=" * 70)
     total = len(results_log)
     passed_count = sum(r["passed"] for r in results_log)
@@ -451,7 +551,8 @@ def run_simulation():
 
     # Restore
     D.send_email = original_send
-    D.classify_greg_email = original_classify
+    D.classify_trusted_email = original_classify
+    D._second_opinion = original_second_opinion
     __import__("subprocess").Popen = original_popen
 
     return all_passed, results_log
