@@ -1405,8 +1405,22 @@ def handle_trusted_email(email_data, config, logger):
         "## Task\n"
         f"Handle this work request. Category: {category}. "
         "Complete the requested work and report back.\n\n"
+        "## Deploy policy\n"
+        "This repo auto-deploys to production (Netlify) on push to `master`. "
+        "First classify your change:\n"
+        "- NON-BREAKING (content/text edits, copy, adding or updating a member or section, "
+        "image swaps, minor styling that can't break navigation, the build, or existing "
+        "functionality): commit and push to `master` so it deploys live.\n"
+        "- BREAKING (removing/renaming/moving a page, changing site navigation or structure, "
+        "JS/logic changes that could error, data-shape changes, layout overhauls, edits to "
+        "shared includes/templates, or anything you are unsure about): DO NOT push to master. "
+        "Push to a branch named `preview/<task>` so Netlify builds a preview deploy, leave "
+        "production untouched, and report the preview URL. It goes live only after a human "
+        "Accepts it in the change log. When in doubt, treat the change as breaking.\n"
+        "Record the affected page (production path for non-breaking, preview URL for breaking) "
+        "in the change-log entry so it links to where the change was made.\n\n"
         "## Done criteria\n"
-        f"Changes complete, tested, and a summary written to {audit_path}"
+        f"Changes complete, tested, deployed per the policy above, and a summary written to {audit_path}"
     )
 
     # Resolve repo workdir for this requester (used as --workdir arg to cc-dispatch)
