@@ -1063,10 +1063,18 @@ def check_pending_completions(config, logger):
                 # If this came from the change-request queue, flip it to awaiting-review.
                 if task.get("change_request_id") and log_type == "completion_sent":
                     try:
+                        patch = {"status": "awaiting-review", "updated_at": datetime.utcnow().isoformat() + "Z"}
+                        # Capture the commit the build produced (HEAD moved) so the
+                        # Change Log can offer a one-click Revert targeting that SHA.
+                        repo = task.get("repo_path")
+                        if repo:
+                            head_after = _git_head(repo)
+                            if head_after and head_after != task.get("head_before"):
+                                patch["commit_sha"] = head_after
                         _supa("PATCH", "/rest/v1/change_requests?id=eq." + str(task["change_request_id"]),
-                              {"status": "awaiting-review", "updated_at": datetime.utcnow().isoformat() + "Z"},
-                              prefer="return=minimal")
-                        logging.info(f"[completion] change_request {task['change_request_id']} -> awaiting-review")
+                              patch, prefer="return=minimal")
+                        logging.info(f"[completion] change_request {task['change_request_id']} -> awaiting-review"
+                                     + (f" (commit {patch.get('commit_sha','')[:8]})" if patch.get('commit_sha') else ""))
                     except Exception as e:
                         logging.error(f"[completion] failed to mark change_request: {e}")
             except Exception as e:
@@ -1821,6 +1829,17 @@ def process_change_queue(config, logger):
             logging.error(f"[queue] dispatch error on {r.get('id')}: {e}")
 
 
+def _git_head(repo_path):
+    """Return the current HEAD commit SHA of repo_path, or None."""
+    try:
+        out = subprocess.run(["git", "-C", repo_path, "rev-parse", "HEAD"],
+                             capture_output=True, text=True, timeout=10)
+        sha = (out.stdout or "").strip()
+        return sha or None
+    except Exception:
+        return None
+
+
 def _dispatch_change_request(config, r):
     """Dispatch an approved change request to a dev worker (cc-dispatch), with the
     breaking/non-breaking deploy policy. Registers a pending completion carrying the
@@ -1856,6 +1875,7 @@ def _dispatch_change_request(config, r):
     if not os.path.exists(mac_cmd):
         logging.error(f"[queue] cc-dispatch not found at {mac_cmd}")
         return None
+    head_before = _git_head(repo_path)
     proc = subprocess.Popen(
         [mac_cmd, "--workdir", repo_path, task_name, prompt],
         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
@@ -1867,6 +1887,8 @@ def _dispatch_change_request(config, r):
         "requester_email": (r.get("requester_email") or "").lower(),
         "extra_cc": [],
         "subject": title,
+        "repo_path": repo_path,
+        "head_before": head_before,
         "dispatched_at": datetime.now().isoformat(),
         "notified": False,
     })
