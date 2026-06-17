@@ -79,6 +79,37 @@ def get_password(label, env_var, memory_section=None):
     raise RuntimeError(f"No password for {label}. Set {env_var} or update memory/context/email.md")
 
 
+def _load_env():
+    """Load KEY=VALUE lines from the daemon's local .env (gitignored) into the
+    environment — used for the Supabase service key / URL for the change queue."""
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
+    if not os.path.exists(path):
+        return
+    try:
+        with open(path) as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                k, v = line.split("=", 1)
+                os.environ.setdefault(k.strip(), v.strip())
+    except Exception:
+        pass
+
+
+def _supa(method, path, body=None, prefer=None):
+    """Supabase REST call with the service-role key (bypasses RLS). Returns the
+    response, or None if not configured."""
+    url = os.environ.get("SUPABASE_URL")
+    key = os.environ.get("SUPABASE_SERVICE_ROLE_KEY")
+    if not url or not key:
+        return None
+    headers = {"apikey": key, "Authorization": "Bearer " + key, "Content-Type": "application/json"}
+    if prefer:
+        headers["Prefer"] = prefer
+    return requests.request(method, url + path, headers=headers, json=body, timeout=30)
+
+
 def _get_trusted_requesters(config):
     """
     Return {email_lower: requester_config} for all trusted senders.
@@ -1733,6 +1764,91 @@ def execute_action(config, email_data, decision, logger, dry_run=False):
 # Main loop
 # ---------------------------------------------------------------------------
 
+def process_change_queue(config, logger):
+    """Process new rows in the unified change_requests queue (Bill intake + email).
+    Vet each via the reversibility second opinion, then route by requester role:
+      - owner/admin → auto-proceed (status 'approved'; build-firing is the next step)
+      - others      → reversibility-gated: reversible+low-risk auto-proceeds,
+                      otherwise → 'awaiting-approval' + a DEEP-LINKED email to the
+                      manager (admin-changelog.html#req-<id>).
+    """
+    _load_env()
+    if not os.environ.get("SUPABASE_SERVICE_ROLE_KEY"):
+        return
+    changelog_url = config.get("changelog_url", "")
+    forward_to = config.get("forward_to")
+    try:
+        resp = _supa("GET", "/rest/v1/change_requests?status=eq.new&order=created_at.asc&limit=10")
+        if not resp or not resp.ok:
+            return
+        rows = resp.json()
+    except Exception as e:
+        logging.warning(f"[queue] poll failed: {e}")
+        return
+    if not isinstance(rows, list) or not rows:
+        return
+    logging.info(f"[queue] {len(rows)} new change request(s)")
+    for r in rows:
+        try:
+            _process_one_request(config, r, changelog_url, forward_to)
+        except Exception as e:
+            logging.error(f"[queue] error on {r.get('id')}: {e}")
+
+
+def _process_one_request(config, r, changelog_url, forward_to):
+    rid = r.get("id")
+    role = (r.get("requester_role") or "member").lower()
+    desc = r.get("description") or ""
+    title = r.get("title") or desc[:80]
+
+    # Reversibility vet (reuse the second-opinion rubric).
+    email_data = {"subject": title, "body": desc}
+    requester = {"name": r.get("requester_name") or "requester", "site_label": "the website"}
+    first_pass = {"category": "destructive" if r.get("type") == "change" else "on_site_build"}
+    vet = None
+    try:
+        vet = _second_opinion(config, email_data, requester, first_pass)
+    except Exception:
+        vet = None
+    if not vet:
+        vet = {"reversible": False, "risk": "medium",
+               "reason": "Could not auto-vet — routing to a human for approval.",
+               "category": "ambiguous"}
+
+    reversible = vet.get("reversible") is True
+    risk = vet.get("risk", "medium")
+    is_owner = role in ("owner", "admin")
+    needs_approval = (not is_owner) and ((not reversible) or risk == "high")
+    vet_store = {"reversible": reversible, "risk": risk,
+                 "reason": vet.get("reason", ""), "needs_approval": needs_approval}
+    new_status = "awaiting-approval" if needs_approval else "approved"
+
+    _supa("PATCH", "/rest/v1/change_requests?id=eq." + str(rid),
+          {"status": new_status, "vet": vet_store, "updated_at": datetime.utcnow().isoformat() + "Z"},
+          prefer="return=minimal")
+    logging.info(f"[queue] {rid} role={role} reversible={reversible} risk={risk} -> {new_status}")
+
+    if needs_approval and forward_to:
+        link = (changelog_url + "#req-" + str(rid)) if changelog_url else ""
+        who = r.get("requester_name") or r.get("requester_email") or "a member"
+        body = "\n".join([
+            f"{who} submitted a change request that needs your approval.",
+            "",
+            f"Request: {title}",
+            f"Details: {desc}",
+            "",
+            "Vet: " + (vet_store["reason"] or "—") + " (" +
+            ("reversible" if reversible else "IRREVERSIBLE") + f", risk {risk})",
+            "",
+            (f"Review and approve here: {link}" if link else "Open the Site Change Log to review it."),
+        ])
+        try:
+            send_email(config, forward_to, f"[Approve] {title}", body)
+            logging.info(f"[queue] approval email sent for {rid} -> {forward_to}")
+        except Exception as e:
+            logging.error(f"[queue] approval email failed for {rid}: {e}")
+
+
 def run_cycle(config, state, logger, dry_run=False):
     """Run one check cycle: fetch new emails + drafts, route, act."""
     results = []
@@ -1842,7 +1958,14 @@ def run_cycle(config, state, logger, dry_run=False):
     else:
         logging.debug("Skipping draft check — MIKE_EMAIL_PW not set")
 
-    # 3. Check pending completions — send "done" emails when dispatched tasks land
+    # 3. Process the unified change-request queue (Bill intake + email)
+    if not dry_run:
+        try:
+            process_change_queue(config, logger)
+        except Exception as e:
+            logging.error(f"Error processing change queue: {e}")
+
+    # 4. Check pending completions — send "done" emails when dispatched tasks land
     if not dry_run:
         check_pending_completions(config, logger)
 

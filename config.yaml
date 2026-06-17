@@ -49,6 +49,11 @@ draft_prefix: "[CLAUDE]"
 # --- Forwarding ---
 forward_to: mw@mike-wolf.com
 
+# --- Change-request queue (Bill intake + email) ---
+# The daemon polls public.change_requests (Supabase URL + service key from .env)
+# and routes them. Approval emails deep-link to a specific item via this URL.
+changelog_url: https://legends-membership.netlify.app/admin-changelog.html
+
 # --- Logging ---
 log_dir: ~/Projects/claude-email-daemon/logs
 state_file: ~/Projects/claude-email-daemon/state/processed.json
