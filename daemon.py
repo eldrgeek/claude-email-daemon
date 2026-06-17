@@ -1060,6 +1060,15 @@ def check_pending_completions(config, logger):
                 task["notify_type"] = log_type
                 updated = True
                 logging.info(f"[completion] sent {log_type} for task={task_name} to {requester_from}")
+                # If this came from the change-request queue, flip it to awaiting-review.
+                if task.get("change_request_id") and log_type == "completion_sent":
+                    try:
+                        _supa("PATCH", "/rest/v1/change_requests?id=eq." + str(task["change_request_id"]),
+                              {"status": "awaiting-review", "updated_at": datetime.utcnow().isoformat() + "Z"},
+                              prefer="return=minimal")
+                        logging.info(f"[completion] change_request {task['change_request_id']} -> awaiting-review")
+                    except Exception as e:
+                        logging.error(f"[completion] failed to mark change_request: {e}")
             except Exception as e:
                 logging.error(f"[completion] failed to send completion for task={task_name}: {e}")
 
@@ -1785,14 +1794,84 @@ def process_change_queue(config, logger):
     except Exception as e:
         logging.warning(f"[queue] poll failed: {e}")
         return
-    if not isinstance(rows, list) or not rows:
-        return
-    logging.info(f"[queue] {len(rows)} new change request(s)")
-    for r in rows:
+    if not isinstance(rows, list):
+        rows = []
+    if rows:
+        logging.info(f"[queue] {len(rows)} new change request(s)")
+        for r in rows:
+            try:
+                _process_one_request(config, r, changelog_url, forward_to)
+            except Exception as e:
+                logging.error(f"[queue] error on {r.get('id')}: {e}")
+
+    # Build-firing: dispatch APPROVED requests to a dev worker (cc-dispatch).
+    try:
+        ar = _supa("GET", "/rest/v1/change_requests?status=eq.approved&order=created_at.asc&limit=5")
+        approved = ar.json() if (ar and ar.ok) else []
+    except Exception:
+        approved = []
+    for r in approved:
         try:
-            _process_one_request(config, r, changelog_url, forward_to)
+            pid = _dispatch_change_request(config, r)
+            if pid is not None:
+                _supa("PATCH", "/rest/v1/change_requests?id=eq." + str(r["id"]),
+                      {"status": "in-progress", "updated_at": datetime.utcnow().isoformat() + "Z"},
+                      prefer="return=minimal")
         except Exception as e:
-            logging.error(f"[queue] error on {r.get('id')}: {e}")
+            logging.error(f"[queue] dispatch error on {r.get('id')}: {e}")
+
+
+def _dispatch_change_request(config, r):
+    """Dispatch an approved change request to a dev worker (cc-dispatch), with the
+    breaking/non-breaking deploy policy. Registers a pending completion carrying the
+    change_request_id so the completion pass flips it to 'awaiting-review' + notifies."""
+    import re as _re
+    rid = r["id"]
+    title = r.get("title") or "change"
+    desc = r.get("description") or ""
+    repo_path = os.path.expanduser(config.get("change_repo", "~/Projects/legends-membership-site"))
+    iso_now = datetime.now().strftime("%Y%m%dT%H%M%S")
+    task_name = (_re.sub(r"[^\w\-]", "-", title).strip("-") or "change")[:40]
+    audit_path = f"~/Projects/SOMA/audits/{iso_now}-{task_name}.md"
+    prompt = (
+        "## Context\n"
+        f"Change request from {r.get('requester_name') or r.get('requester_email') or 'a requester'}.\n"
+        f"Page: {r.get('page', '')}\n\n"
+        f"## Request\n{desc}\n\n"
+        "## Task\nHandle this change request. Complete the work and report back.\n\n"
+        "## Deploy policy\n"
+        "This repo auto-deploys to production (Netlify) on push to `master`. NON-BREAKING "
+        "(content/text/styling that can't break navigation, the build, or existing "
+        "functionality): commit and push to master. BREAKING (removing/renaming/moving a page, "
+        "nav/structure changes, JS/logic that could error, layout overhauls, or anything you "
+        "are unsure about): push to a `preview/<task>` branch so Netlify builds a preview, leave "
+        "production untouched, and report the preview URL — it goes live only after a human "
+        "Accepts it. When in doubt, treat the change as breaking.\n\n"
+        "## Done criteria\n"
+        f"Changes complete, tested, deployed per the policy above, and a summary written to {audit_path}"
+    )
+    mac_cmd = os.path.expanduser(
+        config.get("dispatch", {}).get("platforms", {}).get("Mac", {}).get("command", "~/.local/bin/cc-dispatch")
+    )
+    if not os.path.exists(mac_cmd):
+        logging.error(f"[queue] cc-dispatch not found at {mac_cmd}")
+        return None
+    proc = subprocess.Popen(
+        [mac_cmd, "--workdir", repo_path, task_name, prompt],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    )
+    _save_pending(config, {
+        "task_name": task_name,
+        "change_request_id": rid,
+        "requester_from": r.get("requester_email") or config.get("forward_to"),
+        "requester_email": (r.get("requester_email") or "").lower(),
+        "extra_cc": [],
+        "subject": title,
+        "dispatched_at": datetime.now().isoformat(),
+        "notified": False,
+    })
+    logging.info(f"[queue] dispatched change request {rid} task={task_name} pid={proc.pid}")
+    return proc.pid
 
 
 def _process_one_request(config, r, changelog_url, forward_to):
