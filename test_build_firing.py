@@ -7,6 +7,7 @@ from unittest.mock import MagicMock
 sys.path.insert(0, str(Path(__file__).parent))
 import daemon as D
 
+os.environ["DAEMON_ALLOW_TEST_ROWS"] = "1"  # let the queue see source='test' seeds
 D._load_env()
 cfg = D.load_config()
 cfg["forward_to"] = "mw@mike-wolf.com"

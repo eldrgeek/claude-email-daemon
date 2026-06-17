@@ -1808,8 +1808,11 @@ def process_change_queue(config, logger):
         return
     changelog_url = config.get("changelog_url", "")
     forward_to = config.get("forward_to")
+    # SAFETY: the live daemon never dispatches source='test' rows (left behind by
+    # the test suite). Tests set DAEMON_ALLOW_TEST_ROWS=1 to exercise the pipeline.
+    test_filter = "" if os.environ.get("DAEMON_ALLOW_TEST_ROWS") == "1" else "&source=neq.test"
     try:
-        resp = _supa("GET", "/rest/v1/change_requests?status=eq.new&order=created_at.asc&limit=10")
+        resp = _supa("GET", "/rest/v1/change_requests?status=eq.new" + test_filter + "&order=created_at.asc&limit=10")
         if not resp or not resp.ok:
             return
         rows = resp.json()
@@ -1828,7 +1831,7 @@ def process_change_queue(config, logger):
 
     # Build-firing: dispatch APPROVED requests to a dev worker (cc-dispatch).
     try:
-        ar = _supa("GET", "/rest/v1/change_requests?status=eq.approved&order=created_at.asc&limit=5")
+        ar = _supa("GET", "/rest/v1/change_requests?status=eq.approved" + test_filter + "&order=created_at.asc&limit=5")
         approved = ar.json() if (ar and ar.ok) else []
     except Exception:
         approved = []

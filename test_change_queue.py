@@ -6,8 +6,10 @@ import sys, json
 from pathlib import Path
 from unittest.mock import MagicMock
 sys.path.insert(0, str(Path(__file__).parent))
+import os
 import daemon as D
 
+os.environ["DAEMON_ALLOW_TEST_ROWS"] = "1"  # let the queue see source='test' seeds
 D._load_env()
 config = D.load_config()
 config["changelog_url"] = "https://legends-membership.netlify.app/admin-changelog.html"
@@ -22,6 +24,14 @@ def fake_vet(cfg, email_data, requester, first_pass):
         return {"reversible": False, "risk": "high", "reason": "Irreversible data loss", "category": "destructive"}
     return {"reversible": True, "risk": "low", "reason": "Reversible content edit", "category": "on_site_build"}
 D._second_opinion = fake_vet
+
+# SAFETY: never fire a real build from a test. Auto-approved rows are dispatched in
+# the same cycle, so stub the dispatch primitives.
+class _FakeProc: pid = 9999
+_popen_calls = []
+D.subprocess.Popen = lambda args, **k: (_popen_calls.append(args), _FakeProc())[1]
+D._git_head = lambda repo: None
+D._save_pending = lambda cfg, t: None
 
 seeds = [
     {"source": "test", "requester_name": "Mike", "requester_email": "mw@mike-wolf.com", "requester_role": "owner",
@@ -59,7 +69,12 @@ for i in ids:
     D._supa("DELETE", "/rest/v1/change_requests?id=eq." + i, prefer="return=minimal")
 print("cleaned up seeds")
 
-ok = (got[ids[0]]["status"] == "approved" and got[ids[1]]["status"] == "approved"
-      and got[ids[2]]["status"] == "awaiting-approval" and len(sent) == 1 and link_ok)
+# Unified pipeline: auto-approved rows (owner + member-reversible) are dispatched
+# in the same cycle, so they end at 'in-progress'; the risky member row stops at
+# 'awaiting-approval' with a single deep-linked email. Two builds were dispatched.
+print("=== dispatches fired (stubbed):", len(_popen_calls))
+ok = (got[ids[0]]["status"] == "in-progress" and got[ids[1]]["status"] == "in-progress"
+      and got[ids[2]]["status"] == "awaiting-approval" and len(sent) == 1 and link_ok
+      and len(_popen_calls) == 2)
 print("ALL PASS" if ok else "FAIL")
 sys.exit(0 if ok else 1)
