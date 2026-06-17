@@ -539,6 +539,152 @@ def extract_body(msg):
     return ""
 
 
+def _extract_attachment_text(filename, content_type, data):
+    """Best-effort plain-text extraction from an attachment's bytes.
+
+    Returns extracted text, or '' if the type isn't text-extractable here (the
+    worker still gets the saved file path so it can open the file itself)."""
+    name = (filename or "").lower()
+    ctype = (content_type or "").lower()
+
+    # Plain-text-ish formats: decode directly.
+    if (ctype.startswith("text/") or
+            name.endswith((".txt", ".md", ".markdown", ".csv", ".tsv", ".log",
+                           ".json", ".html", ".htm", ".rtf"))):
+        try:
+            return data.decode("utf-8", errors="replace")
+        except Exception:
+            return ""
+
+    # PDF: try pdfminer, then pypdf/PyPDF2 — all optional.
+    if ctype == "application/pdf" or name.endswith(".pdf"):
+        import io
+        try:
+            from pdfminer.high_level import extract_text  # type: ignore
+            return extract_text(io.BytesIO(data)) or ""
+        except Exception:
+            pass
+        for mod in ("pypdf", "PyPDF2"):
+            try:
+                reader_mod = __import__(mod)
+                reader = reader_mod.PdfReader(io.BytesIO(data))
+                return "\n".join((p.extract_text() or "") for p in reader.pages)
+            except Exception:
+                continue
+        return ""
+
+    # DOCX: a zip of XML — pull text from word/document.xml without extra deps.
+    if (name.endswith(".docx") or
+            ctype == "application/vnd.openxmlformats-officedocument.wordprocessingml.document"):
+        import io, zipfile, re as _re
+        try:
+            with zipfile.ZipFile(io.BytesIO(data)) as z:
+                xml = z.read("word/document.xml").decode("utf-8", errors="replace")
+            xml = xml.replace("</w:p>", "\n")
+            return _re.sub(r"<[^>]+>", "", xml)
+        except Exception:
+            return ""
+
+    return ""
+
+
+def extract_attachments(msg, save_dir):
+    """Walk an email, save each attachment to save_dir, and extract text where we can.
+
+    Returns a list of dicts: {filename, content_type, path, size, text}.
+    Inline images / signatures with no filename are skipped."""
+    attachments = []
+    if not msg.is_multipart():
+        return attachments
+
+    for part in msg.walk():
+        if part.get_content_maintype() == "multipart":
+            continue
+        filename = part.get_filename()
+        disposition = (part.get("Content-Disposition") or "").lower()
+        # Only real attachments (named, or explicitly disposition=attachment).
+        if not filename and "attachment" not in disposition:
+            continue
+        try:
+            data = part.get_payload(decode=True)
+        except Exception:
+            data = None
+        if not data:
+            continue
+
+        if filename:
+            decoded = decode_header(filename)
+            filename = "".join(
+                p.decode(enc or "utf-8", errors="replace") if isinstance(p, bytes) else p
+                for p, enc in decoded
+            )
+        else:
+            ext = (part.get_content_subtype() or "bin")
+            filename = f"attachment-{len(attachments) + 1}.{ext}"
+        # Sanitize so we never write outside save_dir.
+        safe_name = re.sub(r"[^\w.\- ]", "_", os.path.basename(filename)).strip() or "attachment"
+
+        content_type = part.get_content_type()
+        saved_path = ""
+        try:
+            os.makedirs(save_dir, exist_ok=True)
+            saved_path = os.path.join(save_dir, safe_name)
+            with open(saved_path, "wb") as fh:
+                fh.write(data)
+        except Exception as e:
+            logging.warning(f"[attachments] could not save {safe_name}: {e}")
+            saved_path = ""
+
+        text = ""
+        try:
+            text = _extract_attachment_text(safe_name, content_type, data)
+        except Exception as e:
+            logging.warning(f"[attachments] text extraction failed for {safe_name}: {e}")
+
+        attachments.append({
+            "filename": safe_name,
+            "content_type": content_type,
+            "path": saved_path,
+            "size": len(data),
+            "text": text,
+        })
+
+    return attachments
+
+
+def _format_attachments_section(attachments, per_file_chars=6000):
+    """Render an '## Attachments' block for the worker prompt.
+
+    Includes each attachment's filename, saved absolute path (so the worker can
+    open it directly with its own tools), and any extracted text inline."""
+    if not attachments:
+        return ""
+    lines = ["## Attachments",
+             "This email included the following attachment(s). Use their content to "
+             "complete the request — do NOT report the request as missing material.",
+             ""]
+    for i, a in enumerate(attachments, 1):
+        header = f"### Attachment {i}: {a.get('filename', '(unnamed)')}"
+        meta = f"- Type: {a.get('content_type', 'unknown')}; Size: {a.get('size', 0)} bytes"
+        if a.get("path"):
+            meta += f"\n- Saved at: {a['path']} (open this file directly if you need the original)"
+        lines.append(header)
+        lines.append(meta)
+        text = (a.get("text") or "").strip()
+        if text:
+            if len(text) > per_file_chars:
+                text = text[:per_file_chars] + "\n…[truncated — read the full file at the path above]"
+            lines.append("")
+            lines.append("Extracted content:")
+            lines.append("```")
+            lines.append(text)
+            lines.append("```")
+        else:
+            lines.append("- (No text extracted automatically — open the saved file at the path above to read it.)")
+        lines.append("")
+    return "\n".join(lines) + "\n"
+
+
 def fetch_new_emails(imap_server, address, password, state, source="inbox"):
     """Fetch unprocessed emails from an IMAP mailbox."""
     mail = imaplib.IMAP4_SSL(imap_server)
@@ -563,6 +709,18 @@ def fetch_new_emails(imap_server, address, password, state, source="inbox"):
         if state.is_processed(source, stable_id):
             continue
 
+        # Pull any attachments (e.g. a blueprint doc) so the worker can actually
+        # see them — previously only the text body was read, so attachment-only
+        # requests came back blocked.
+        attach_dir = os.path.expanduser(
+            f"~/Projects/claude-email-daemon/state/attachments/{re.sub(r'[^A-Za-z0-9]', '_', stable_id)}"
+        )
+        try:
+            attachments = extract_attachments(msg, attach_dir)
+        except Exception as e:
+            logging.warning(f"[attachments] extraction error for {stable_id}: {e}")
+            attachments = []
+
         new_emails.append({
             "imap_id": mid_str,
             "stable_id": stable_id,
@@ -573,6 +731,7 @@ def fetch_new_emails(imap_server, address, password, state, source="inbox"):
             "subject": decode_subject(msg["Subject"]),
             "date": msg["Date"] or "",
             "body": extract_body(msg)[:2000],  # Truncate long bodies
+            "attachments": attachments,
             "references": msg.get("References", ""),
             "authentication_results": msg.get("Authentication-Results", ""),
         })
@@ -941,6 +1100,50 @@ def _extract_report_summary(report_text, max_chars=3000):
     return "\n".join(body_lines)[:max_chars].strip()
 
 
+def _detect_blocked(report_text):
+    """If an audit report indicates the worker couldn't complete the task, return a
+    short human-readable reason; otherwise ''. Used to mark a change_request 'blocked'
+    rather than 'awaiting-review' when no work actually shipped."""
+    if not report_text:
+        return ""
+    low = report_text.lower()
+    markers = [
+        "blocked — incomplete", "blocked - incomplete", "blocked—incomplete",
+        "**blocked", "blocked:", "incomplete request", "could not complete",
+        "unable to complete", "no blueprint", "no attachment", "missing attachment",
+        "nothing to add", "cannot proceed", "needs more information", "need more information",
+    ]
+    if not any(m in low for m in markers):
+        return ""
+    # Prefer the worker's own one-line explanation from the final-assistant section.
+    idx = report_text.find("## Final assistant text")
+    snippet = report_text[idx:] if idx != -1 else report_text
+    for line in snippet.splitlines():
+        s = line.strip().lstrip("*# ").strip()
+        if len(s) > 25 and ("block" in s.lower() or "incomplete" in s.lower()
+                            or "missing" in s.lower() or "could not" in s.lower()
+                            or "unable" in s.lower()):
+            return s[:240]
+    return "The automated worker reported it could not complete this request."
+
+
+def _merge_change_request_context(request_id, extra):
+    """Read-modify-write the change_requests.context jsonb so we add keys (e.g. a
+    'blocked' reason) without clobbering existing context. Best-effort."""
+    try:
+        res = _supa("GET", "/rest/v1/change_requests?select=context&id=eq." + str(request_id))
+        ctx = {}
+        if res is not None and res.ok:
+            rows = res.json()
+            if rows and isinstance(rows[0].get("context"), dict):
+                ctx = rows[0]["context"]
+        ctx.update(extra or {})
+        _supa("PATCH", "/rest/v1/change_requests?id=eq." + str(request_id),
+              {"context": ctx}, prefer="return=minimal")
+    except Exception as e:
+        logging.warning(f"[completion] could not merge context for {request_id}: {e}")
+
+
 def check_pending_completions(config, logger):
     """
     Check whether any pending trusted-requester tasks have completed (audit report on disk).
@@ -1060,21 +1263,41 @@ def check_pending_completions(config, logger):
                 task["notify_type"] = log_type
                 updated = True
                 logging.info(f"[completion] sent {log_type} for task={task_name} to {requester_from}")
-                # If this came from the change-request queue, flip it to awaiting-review.
+                # If this came from the change-request queue, update its status.
                 if task.get("change_request_id") and log_type == "completion_sent":
                     try:
-                        patch = {"status": "awaiting-review", "updated_at": datetime.utcnow().isoformat() + "Z"}
                         # Capture the commit the build produced (HEAD moved) so the
                         # Change Log can offer a one-click Revert targeting that SHA.
+                        commit_sha = None
                         repo = task.get("repo_path")
                         if repo:
                             head_after = _git_head(repo)
                             if head_after and head_after != task.get("head_before"):
-                                patch["commit_sha"] = head_after
-                        _supa("PATCH", "/rest/v1/change_requests?id=eq." + str(task["change_request_id"]),
-                              patch, prefer="return=minimal")
-                        logging.info(f"[completion] change_request {task['change_request_id']} -> awaiting-review"
-                                     + (f" (commit {patch.get('commit_sha','')[:8]})" if patch.get('commit_sha') else ""))
+                                commit_sha = head_after
+
+                        # Did the worker actually do the work, or report itself blocked?
+                        # A "Blocked"/incomplete report with no commit means nothing
+                        # shipped — mark it 'blocked' (not 'awaiting-review') so the
+                        # Change Log shows WHY instead of an empty review preview.
+                        blocked_reason = _detect_blocked(report_text)
+                        if blocked_reason and not commit_sha:
+                            patch = {"status": "blocked",
+                                     "updated_at": datetime.utcnow().isoformat() + "Z"}
+                            _supa("PATCH", "/rest/v1/change_requests?id=eq." + str(task["change_request_id"]),
+                                  patch, prefer="return=minimal")
+                            _merge_change_request_context(
+                                task["change_request_id"], {"blocked": blocked_reason})
+                            logging.info(f"[completion] change_request {task['change_request_id']} -> blocked "
+                                         f"({blocked_reason[:60]})")
+                        else:
+                            patch = {"status": "awaiting-review",
+                                     "updated_at": datetime.utcnow().isoformat() + "Z"}
+                            if commit_sha:
+                                patch["commit_sha"] = commit_sha
+                            _supa("PATCH", "/rest/v1/change_requests?id=eq." + str(task["change_request_id"]),
+                                  patch, prefer="return=minimal")
+                            logging.info(f"[completion] change_request {task['change_request_id']} -> awaiting-review"
+                                         + (f" (commit {commit_sha[:8]})" if commit_sha else ""))
                     except Exception as e:
                         logging.error(f"[completion] failed to mark change_request: {e}")
             except Exception as e:
@@ -1450,6 +1673,7 @@ def handle_trusted_email(email_data, config, logger):
         f"Email from {req_name} ({sender_email}).\n"
         f"Subject: {email_data.get('subject', '')}\n\n"
         f"## Email Body\n{email_data.get('body', '')}\n\n"
+        f"{_format_attachments_section(email_data.get('attachments'))}"
         "## Task\n"
         f"Handle this work request. Category: {category}. "
         "Complete the requested work and report back.\n\n"
