@@ -1514,6 +1514,7 @@ def handle_trusted_email(email_data, config, logger):
             )
         return _escalate(f"cc-dispatch not found at {mac_cmd}", classification)
 
+    head_before = _git_head(repo_path) if repo_path else None
     try:
         cmd_args = [mac_cmd]
         if repo_path:
@@ -1574,6 +1575,16 @@ def handle_trusted_email(email_data, config, logger):
     with open(log_path, "w") as f:
         json.dump(dispatch_result, f, indent=2)
 
+    # Unified queue: mirror this email-originated dispatch into change_requests so it
+    # shows up in the Change Log alongside Bill intake and gets the same Review / Accept
+    # / Revert lifecycle. Visibility only — the proven email dispatch/ack/CC path above
+    # is untouched. Best-effort: a failure here never blocks the dispatch.
+    crid = _mirror_email_to_change_request(
+        config, email_data, requester, tier, classification, repo_path, task_name, sender_email
+    )
+    if crid:
+        dispatch_result["change_request_id"] = crid
+
     # Register pending completion notification
     _save_pending(config, {
         "task_name": task_name,
@@ -1583,6 +1594,9 @@ def handle_trusted_email(email_data, config, logger):
         "subject": email_data.get("subject", ""),
         "message_id": email_data.get("message_id", ""),
         "references": email_data.get("references", ""),
+        "change_request_id": crid,
+        "repo_path": repo_path,
+        "head_before": head_before,
         "dispatched_at": datetime.now().isoformat(),
         "notified": False,
     })
@@ -1827,6 +1841,43 @@ def process_change_queue(config, logger):
                       prefer="return=minimal")
         except Exception as e:
             logging.error(f"[queue] dispatch error on {r.get('id')}: {e}")
+
+
+def _mirror_email_to_change_request(config, email_data, requester, tier, classification, repo_path, task_name, sender_email=None):
+    """Insert an email-originated dispatch into change_requests (status in-progress) so
+    it appears in the unified Change Log and shares the Review/Accept/Revert lifecycle.
+    Returns the new row id, or None on any failure (never blocks the email path)."""
+    try:
+        _load_env()
+        cat = (classification or {}).get("category", "on_site_build")
+        reversible = cat not in ("destructive", "access_control")
+        risk = "high" if not reversible else "low"
+        subject = email_data.get("subject") or task_name or "change"
+        body = (email_data.get("body") or "").strip()
+        row = {
+            "source": "email",
+            "requester_name": requester.get("name") or requester.get("ack_greeting", "").replace("Hi", "").strip(", "),
+            "requester_email": (sender_email or requester.get("email") or "").lower() or None,
+            "requester_role": "owner" if tier == "owner" else "member",
+            "type": "change",
+            "title": subject[:200],
+            "description": (body[:5000] or subject),
+            "status": "in-progress",
+            "vet": {"category": cat, "reversible": reversible, "risk": risk,
+                    "reason": (classification or {}).get("reason") or "Classified by the email pipeline."},
+            "context": {"source": "email", "message_id": email_data.get("message_id", ""), "task_name": task_name},
+            "updated_at": datetime.utcnow().isoformat() + "Z",
+        }
+        resp = _supa("POST", "/rest/v1/change_requests", row, prefer="return=representation")
+        if resp is not None and getattr(resp, "ok", False):
+            data = resp.json()
+            rid = data[0]["id"] if data else None
+            if rid:
+                logging.info(f"[unify] mirrored email dispatch into change_request {rid}")
+            return rid
+    except Exception as e:
+        logging.warning(f"[unify] could not mirror email to change_requests: {e}")
+    return None
 
 
 def _git_head(repo_path):
