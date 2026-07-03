@@ -458,6 +458,20 @@ BOARD_SUBJECT_RE = re.compile(r'^\[BOARD\]\s*(.*)', re.IGNORECASE)
 
 BOARD_INBOX_DIR = '~/Projects/SOMA/board/inbox'
 
+# ---------------------------------------------------------------------------
+# Fathom meeting-summary short-circuit
+# ---------------------------------------------------------------------------
+# Fathom (fathom.video/.ai) emails a meeting summary after every call. Mike's
+# tier has no API/webhook (Enterprise-only); the v0 ingestion path forwards
+# those emails from mw@ to claude@mike-wolf.com (Gmail filter — see
+# second-brain/docs/FATHOM-SETUP.md) and a separate poller
+# (second-brain/scripts/fathom_import.py, its own cron/launchd job and state
+# file) writes them into the vault. That import is unrelated to this daemon's
+# LLM-routing loop — this short-circuit exists purely so Fathom mail doesn't
+# fall through to route_email() and waste an LLM call / risk a nonsense
+# "action" on a meeting summary that isn't an instruction to Claude at all.
+FATHOM_SENDER_RE = re.compile(r'@fathom\.(video|ai)', re.IGNORECASE)
+
 
 def _slugify(text, max_len=60):
     slug = re.sub(r'[^a-z0-9]+', '-', text.lower()).strip('-')
@@ -1149,6 +1163,128 @@ def _second_opinion(config, email_data, requester, first_pass):
         return None
 
 
+def decompose_email_tasks(config, email_data, requester, classification):
+    """Split a trusted-requester email into independently-fated tasks.
+
+    A task is a unit of work that SHARES A FATE: split only when outcomes can
+    diverge (one part ships while another blocks) or inputs differ (one part needs
+    material another doesn't). Do NOT split for atomicity — several edits to one
+    page are ONE task.
+
+    Returns a list of normalized task dicts, or None to mean "treat the whole email
+    as a single task" (the caller's safe fallback). Each task:
+      {"title": str, "targets": [str], "kind": "build|verify|diagnose",
+       "needs": [str], "ready": bool}
+
+    Gated: requester['decompose_tasks'] overrides config['decompose_tasks'] (default
+    False). Uses the same `claude` CLI as _second_opinion; any error -> None.
+    """
+    enabled = requester.get("decompose_tasks")
+    if enabled is None:
+        enabled = config.get("decompose_tasks", False)
+    if not enabled:
+        return None
+
+    model = ((config.get("decompose") or {}).get("model")
+             or (config.get("second_opinion") or {}).get("model", "opus"))
+    timeout = (config.get("decompose") or {}).get("timeout_seconds", 180)
+
+    attachments = email_data.get("attachments") or []
+    if attachments:
+        manifest_lines = []
+        for a in attachments:
+            has_text = bool((a.get("text") or "").strip())
+            state = "text extracted" if has_text else "NO text extracted"
+            manifest_lines.append(f"- {a.get('filename', '(unnamed)')} ({state})")
+        manifest = "\n".join(manifest_lines)
+    else:
+        manifest = "(none)"
+
+    rubric = (
+        "You are the work-planner for an automated website-maintenance assistant.\n"
+        "Split the email below into independently-fated TASKS. A task is a unit of "
+        "work that SHARES A FATE: split only when outcomes can diverge (one part can "
+        "ship while another blocks) or inputs differ (one part needs material another "
+        "doesn't). Do NOT split for atomicity — several edits to one page are ONE "
+        "task.\n\n"
+        "Litmus test for whether two items belong in the same task: if item B were "
+        "blocked, would it make sense for item A to ship anyway? If yes -> separate "
+        "tasks. If no -> same task.\n\n"
+        "For each task set:\n"
+        "- title: a short imperative description of the work.\n"
+        "- targets: the page(s), section(s), file(s) or member(s) the task touches "
+        "(may be empty).\n"
+        "- kind: one of 'build' (make/edit/remove content or code), 'verify' (check "
+        "or confirm something is correct), 'diagnose' (figure out why something is "
+        "wrong before any fix can happen).\n"
+        "- needs: material or information that is REQUIRED to do this task but is NOT "
+        "present in the email body or its attachments (e.g. a photo that wasn't "
+        "attached, a spreadsheet, a missing URL). Leave empty if everything needed is "
+        "already here.\n"
+        "- ready: true only when kind is 'build' AND needs is empty (i.e. it can be "
+        "dispatched and completed right now).\n\n"
+        f"Attachment manifest:\n{manifest}\n\n"
+        f"{_format_attachments_section(attachments)}"
+        f"Subject: {email_data.get('subject', '')}\n\n"
+        f"Body: {email_data.get('body', '')}\n\n"
+        "Respond with STRICT JSON only, no other text:\n"
+        '{"tasks": [{"title": "<str>", "targets": ["<str>"], '
+        '"kind": "build|verify|diagnose", "needs": ["<str>"], "ready": true|false}]}'
+    )
+
+    claude_bin = _resolve_claude_bin()
+    try:
+        proc = subprocess.run(
+            [claude_bin, "-p", "--output-format", "json", "--model", model],
+            input=rubric,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+        if proc.returncode != 0:
+            logging.warning(
+                f"decompose: claude exited {proc.returncode}: {proc.stderr[:200]}"
+            )
+            return None
+        # `claude -p --output-format json` wraps the answer as {"result": "...", ...}
+        try:
+            outer = json.loads(proc.stdout.strip())
+            answer = outer.get("result", proc.stdout) if isinstance(outer, dict) else proc.stdout
+        except json.JSONDecodeError:
+            answer = proc.stdout
+        parsed = _parse_classify_json(answer)
+    except Exception as e:
+        logging.warning(f"decompose unavailable ({e}); treating email as a single task")
+        return None
+
+    raw_tasks = parsed.get("tasks")
+    if not isinstance(raw_tasks, list):
+        return None
+
+    normalized = []
+    for t in raw_tasks:
+        if not isinstance(t, dict):
+            continue
+        title = (t.get("title") or "").strip()
+        if not title:
+            continue
+        kind = (t.get("kind") or "build").strip().lower()
+        if kind not in ("build", "verify", "diagnose"):
+            kind = "build"
+        needs = [n.strip() for n in (t.get("needs") or []) if isinstance(n, str) and n.strip()]
+        ready = bool(t.get("ready")) and kind == "build" and not needs
+        targets = [tg.strip() for tg in (t.get("targets") or []) if isinstance(tg, str) and tg.strip()]
+        normalized.append({
+            "title": title,
+            "targets": targets,
+            "kind": kind,
+            "needs": needs,
+            "ready": ready,
+        })
+
+    return normalized or None
+
+
 def _pending_path(config):
     return Path(os.path.expanduser(config["state_file"])).parent / "greg-pending.json"
 
@@ -1773,169 +1909,288 @@ def handle_trusted_email(email_data, config, logger):
     # ----------------------------------------------------------------
     # AUTO-DISPATCH path (reached when all gates pass)
     # ----------------------------------------------------------------
-    task_name_raw = email_data.get("subject", "task")
-    task_name = re.sub(r'[^\w\-]', '-', task_name_raw).strip('-') or 'task'
-    task_name = task_name[:40]
-    audit_path = f"~/Projects/SOMA/audits/{iso_now}-{task_name}.md"
+    def _dispatch_one(task_label, task_instructions):
+        """Dispatch a single unit of work. Reproduces the original single-dispatch
+        block exactly, parameterized by a label (used to build the task_name slug)
+        and the '## Task' instructions block slotted into the worker prompt.
 
-    prompt = (
-        "## Context\n"
-        f"Email from {req_name} ({sender_email}).\n"
-        f"Subject: {email_data.get('subject', '')}\n\n"
-        f"## Email Body\n{email_data.get('body', '')}\n\n"
-        f"{_format_attachments_section(email_data.get('attachments'))}"
-        "## Task\n"
-        f"Handle this work request. Category: {category}. "
-        "Complete the requested work and report back.\n\n"
-        "## Deploy policy\n"
-        "This repo auto-deploys to production (Netlify) on push to `master`. "
-        "First classify your change:\n"
-        "- NON-BREAKING (content/text edits, copy, adding or updating a member or section, "
-        "image swaps, minor styling that can't break navigation, the build, or existing "
-        "functionality): commit and push to `master` so it deploys live.\n"
-        "- BREAKING (removing/renaming/moving a page, changing site navigation or structure, "
-        "JS/logic changes that could error, data-shape changes, layout overhauls, edits to "
-        "shared includes/templates, or anything you are unsure about): DO NOT push the change "
-        "to master. Push it to a branch named `preview/<task>` so Netlify builds a preview at "
-        "`https://preview-<task>--legends-membership.netlify.app`; leave production untouched. "
-        "It goes live only after a human clicks Accept in the change log. When in doubt, treat "
-        "the change as breaking.\n"
-        "Record where the change was made in the change-log entry (in admin-changelog.html, "
-        "committed to master so it shows in the queue as awaiting approval): for non-breaking "
-        "changes set `page` to the production path; for breaking changes set `page` to the "
-        "preview URL and `branch` to the `preview/<task>` branch name (the Accept button uses "
-        "`branch` to merge it live). A request to merge/publish an already-approved preview "
-        "branch into master is itself non-breaking — just do it and push.\n\n"
-        "## Done criteria\n"
-        f"Changes complete, tested, deployed per the policy above, and a summary written to {audit_path}"
-    )
+        Returns the dispatch_result dict (or the _escalate / _surface_hard_stop
+        result on a dispatch error, same as the original inline path).
+        """
+        task_name = re.sub(r'[^\w\-]', '-', task_label).strip('-') or 'task'
+        task_name = task_name[:48]
+        disp_iso = datetime.now().strftime('%Y%m%dT%H%M%S')
+        audit_path = f"~/Projects/SOMA/audits/{disp_iso}-{task_name}.md"
 
-    # Resolve repo workdir for this requester (used as --workdir arg to cc-dispatch)
-    repo_raw = requester.get("repo")
-    repo_path = os.path.expanduser(repo_raw) if repo_raw else None
-    if repo_path and not os.path.isdir(repo_path):
-        logging.warning(f"[trusted/{req_name}] repo path not found: {repo_path} — dispatching without workdir")
-        repo_path = None
-
-    dispatch_result = {
-        "type": "trusted_dispatched",
-        "requester": req_name,
-        "tier": tier,
-        "from": sender_raw,
-        "sender_email": sender_email,
-        "subject": email_data.get("subject", ""),
-        "classification": classification,
-        "task_name": task_name,
-        "extra_cc": extra_cc,
-        "repo": repo_path,
-        "timestamp": datetime.now().isoformat(),
-    }
-
-    mac_cmd = os.path.expanduser(
-        config.get("dispatch", {}).get("platforms", {}).get("Mac", {}).get(
-            "command", "~/.local/bin/cc-dispatch"
+        prompt = (
+            "## Context\n"
+            f"Email from {req_name} ({sender_email}).\n"
+            f"Subject: {email_data.get('subject', '')}\n\n"
+            f"## Email Body\n{email_data.get('body', '')}\n\n"
+            f"{_format_attachments_section(email_data.get('attachments'))}"
+            f"{task_instructions}"
+            "## Deploy policy\n"
+            "This repo auto-deploys to production (Netlify) on push to `master`. "
+            "First classify your change:\n"
+            "- NON-BREAKING (content/text edits, copy, adding or updating a member or section, "
+            "image swaps, minor styling that can't break navigation, the build, or existing "
+            "functionality): commit and push to `master` so it deploys live.\n"
+            "- BREAKING (removing/renaming/moving a page, changing site navigation or structure, "
+            "JS/logic changes that could error, data-shape changes, layout overhauls, edits to "
+            "shared includes/templates, or anything you are unsure about): DO NOT push the change "
+            "to master. Push it to a branch named `preview/<task>` so Netlify builds a preview at "
+            "`https://preview-<task>--legends-membership.netlify.app`; leave production untouched. "
+            "It goes live only after a human clicks Accept in the change log. When in doubt, treat "
+            "the change as breaking.\n"
+            "Record where the change was made in the change-log entry (in admin-changelog.html, "
+            "committed to master so it shows in the queue as awaiting approval): for non-breaking "
+            "changes set `page` to the production path; for breaking changes set `page` to the "
+            "preview URL and `branch` to the `preview/<task>` branch name (the Accept button uses "
+            "`branch` to merge it live). A request to merge/publish an already-approved preview "
+            "branch into master is itself non-breaking — just do it and push.\n\n"
+            "## Done criteria\n"
+            f"Changes complete, tested, deployed per the policy above, and a summary written to {audit_path}"
         )
-    )
-    if not os.path.exists(mac_cmd):
-        logging.error(f"cc-dispatch not found at {mac_cmd}")
-        dispatch_result["action_result"] = "error:cc-dispatch_not_found"
-        if tier == "owner":
-            return _surface_hard_stop(
-                {"category": "dispatch_error",
-                 "reason": f"cc-dispatch not found at {mac_cmd}",
-                 "summary": "cc-dispatch binary missing"},
-                "dispatch_error",
+
+        # Resolve repo workdir for this requester (used as --workdir arg to cc-dispatch)
+        repo_raw = requester.get("repo")
+        repo_path = os.path.expanduser(repo_raw) if repo_raw else None
+        if repo_path and not os.path.isdir(repo_path):
+            logging.warning(f"[trusted/{req_name}] repo path not found: {repo_path} — dispatching without workdir")
+            repo_path = None
+
+        dispatch_result = {
+            "type": "trusted_dispatched",
+            "requester": req_name,
+            "tier": tier,
+            "from": sender_raw,
+            "sender_email": sender_email,
+            "subject": email_data.get("subject", ""),
+            "classification": classification,
+            "task_name": task_name,
+            "extra_cc": extra_cc,
+            "repo": repo_path,
+            "timestamp": datetime.now().isoformat(),
+        }
+
+        mac_cmd = os.path.expanduser(
+            config.get("dispatch", {}).get("platforms", {}).get("Mac", {}).get(
+                "command", "~/.local/bin/cc-dispatch"
             )
-        return _escalate(f"cc-dispatch not found at {mac_cmd}", classification)
-
-    head_before = _git_head(repo_path) if repo_path else None
-    try:
-        cmd_args = [mac_cmd]
-        if repo_path:
-            cmd_args += ["--workdir", repo_path]
-        cmd_args += [task_name, prompt]
-
-        proc = subprocess.Popen(
-            cmd_args,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
         )
-        dispatch_result["dispatch_pid"] = proc.pid
-        dispatch_result["action_result"] = "dispatched"
-        repo_note = f" workdir={repo_path}" if repo_path else ""
-        logging.info(f"[trusted/{req_name}] dispatch task={task_name} pid={proc.pid}{repo_note}")
-    except Exception as e:
-        dispatch_result["action_result"] = f"dispatch_error: {e}"
-        logging.error(f"[trusted/{req_name}] failed to dispatch: {e}")
-        if tier == "owner":
-            return _surface_hard_stop(
-                {"category": "dispatch_error", "reason": str(e),
-                 "summary": f"Dispatch failed: {e}"},
-                "dispatch_error",
+        if not os.path.exists(mac_cmd):
+            logging.error(f"cc-dispatch not found at {mac_cmd}")
+            dispatch_result["action_result"] = "error:cc-dispatch_not_found"
+            if tier == "owner":
+                return _surface_hard_stop(
+                    {"category": "dispatch_error",
+                     "reason": f"cc-dispatch not found at {mac_cmd}",
+                     "summary": "cc-dispatch binary missing"},
+                    "dispatch_error",
+                )
+            return _escalate(f"cc-dispatch not found at {mac_cmd}", classification)
+
+        head_before = _git_head(repo_path) if repo_path else None
+        try:
+            cmd_args = [mac_cmd]
+            if repo_path:
+                cmd_args += ["--workdir", repo_path]
+            cmd_args += [task_name, prompt]
+
+            proc = subprocess.Popen(
+                cmd_args,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
             )
-        return _escalate(f"Dispatch failed: {e}", classification)
+            dispatch_result["dispatch_pid"] = proc.pid
+            dispatch_result["action_result"] = "dispatched"
+            repo_note = f" workdir={repo_path}" if repo_path else ""
+            logging.info(f"[trusted/{req_name}] dispatch task={task_name} pid={proc.pid}{repo_note}")
+        except Exception as e:
+            dispatch_result["action_result"] = f"dispatch_error: {e}"
+            logging.error(f"[trusted/{req_name}] failed to dispatch: {e}")
+            if tier == "owner":
+                return _surface_hard_stop(
+                    {"category": "dispatch_error", "reason": str(e),
+                     "summary": f"Dispatch failed: {e}"},
+                    "dispatch_error",
+                )
+            return _escalate(f"Dispatch failed: {e}", classification)
 
-    # Ack to requester — gated. Default: NO separate ack; the single completion
-    # email carries the explanation + summary. Set send_ack: true per requester to restore.
-    if requester.get("send_ack", False):
-        reply_body = (
-            f"{ack_greeting}\n\n"
-            f"I've received your request and started working on it.\n\n"
-            f"Task: {task_name}\n"
-            f"Report: {audit_path}\n\n"
-            f"I'll follow up when complete.\n\n"
-            f"Best,\n{ack_signature}"
+        # Ack to requester — gated. Default: NO separate ack; the single completion
+        # email carries the explanation + summary. Set send_ack: true per requester to restore.
+        if requester.get("send_ack", False):
+            reply_body = (
+                f"{ack_greeting}\n\n"
+                f"I've received your request and started working on it.\n\n"
+                f"Task: {task_name}\n"
+                f"Report: {audit_path}\n\n"
+                f"I'll follow up when complete.\n\n"
+                f"Best,\n{ack_signature}"
+            )
+            try:
+                send_email(
+                    config,
+                    sender_raw,
+                    f"Re: {email_data.get('subject', '')}",
+                    reply_body,
+                    in_reply_to=email_data.get("message_id"),
+                    references=email_data.get("references"),
+                    cc=extra_cc if extra_cc else None,
+                )
+                dispatch_result["reply_sent"] = True
+            except Exception as e:
+                dispatch_result["reply_sent"] = False
+                dispatch_result["reply_error"] = str(e)
+                logging.error(f"[trusted/{req_name}] failed to send ack: {e}")
+        else:
+            dispatch_result["reply_sent"] = False
+            dispatch_result["ack_skipped"] = True
+
+        # Per-dispatch log filename includes task_name so multiple decomposed
+        # dispatches within the same iso_now second don't overwrite each other.
+        log_path = log_dir / f"trusted-dispatched-{disp_iso}-{task_name}.json"
+        with open(log_path, "w") as f:
+            json.dump(dispatch_result, f, indent=2)
+
+        # Unified queue: mirror this email-originated dispatch into change_requests so it
+        # shows up in the Change Log alongside Bill intake and gets the same Review / Accept
+        # / Revert lifecycle. Visibility only — the proven email dispatch/ack/CC path above
+        # is untouched. Best-effort: a failure here never blocks the dispatch.
+        crid = _mirror_email_to_change_request(
+            config, email_data, requester, tier, classification, repo_path, task_name, sender_email
         )
+        if crid:
+            dispatch_result["change_request_id"] = crid
+
+        # Register pending completion notification
+        _save_pending(config, {
+            "task_name": task_name,
+            "requester_from": sender_raw,
+            "requester_email": sender_email,
+            "extra_cc": extra_cc,
+            "subject": email_data.get("subject", ""),
+            "message_id": email_data.get("message_id", ""),
+            "references": email_data.get("references", ""),
+            "change_request_id": crid,
+            "repo_path": repo_path,
+            "head_before": head_before,
+            "dispatched_at": datetime.now().isoformat(),
+            "notified": False,
+        })
+
+        return dispatch_result
+
+    def _request_missing_material(blocked):
+        """Email the requester (CC their cc_dispatch_to + escalate_to) about the
+        parts of their email I could NOT start, because material or diagnostic
+        detail is missing. One threaded reply; modeled on _request_clarification.
+        """
+        cc = list(requester.get("cc_dispatch_to", []))
+        escalate_to = requester.get("escalate_to")
+        if (escalate_to and escalate_to.lower() != sender_email
+                and escalate_to.lower() not in [c.lower() for c in cc]):
+            cc.append(escalate_to)
+
+        items = []
+        for n, t in enumerate(blocked, 1):
+            title = t.get("title", "")
+            needs = t.get("needs") or []
+            if t.get("kind") == "diagnose":
+                detail = "; ".join(needs) if needs else "more detail on what's going wrong"
+                items.append(f"{n}. {title} — I need {detail}.")
+            else:
+                detail = "; ".join(needs) if needs else "the material"
+                items.append(
+                    f"{n}. {title} — please reply to this email with {detail} attached. "
+                    "If you sent it before, just tell me you're re-attaching it and I'll "
+                    "find out what went wrong the first time."
+                )
+
+        subj = f"Re: {email_data.get('subject', '')} — a few things I need to finish the rest"
+        lines = [
+            ack_greeting,
+            "",
+            "I've started on the parts of your email I can complete now. Before I can "
+            "finish the rest, I need a few things from you:",
+            "",
+            "\n".join(items),
+            "",
+            f"—{ack_signature}",
+        ]
+
+        result = {
+            "type": "trusted_missing_material",
+            "requester": req_name,
+            "tier": tier,
+            "from": sender_raw,
+            "sender_email": sender_email,
+            "subject": email_data.get("subject", ""),
+            "blocked": [t.get("title", "") for t in blocked],
+            "cc": cc,
+            "timestamp": datetime.now().isoformat(),
+        }
         try:
             send_email(
-                config,
-                sender_raw,
-                f"Re: {email_data.get('subject', '')}",
-                reply_body,
+                config, sender_raw, subj, "\n".join(lines),
                 in_reply_to=email_data.get("message_id"),
                 references=email_data.get("references"),
-                cc=extra_cc if extra_cc else None,
+                cc=cc if cc else None,
             )
-            dispatch_result["reply_sent"] = True
+            result["action_result"] = "missing_material_sent"
         except Exception as e:
-            dispatch_result["reply_sent"] = False
-            dispatch_result["reply_error"] = str(e)
-            logging.error(f"[trusted/{req_name}] failed to send ack: {e}")
-    else:
-        dispatch_result["reply_sent"] = False
-        dispatch_result["ack_skipped"] = True
+            result["action_result"] = f"missing_material_send_error: {e}"
+            logging.error(f"[trusted/{req_name}] failed to send missing-material request: {e}")
+        log_path = log_dir / f"trusted-missing-material-{iso_now}.json"
+        with open(log_path, "w") as f:
+            json.dump(result, f, indent=2)
+        logging.info(f"[trusted/{req_name}] missing-material request sent for {len(blocked)} blocked task(s)")
+        return result
 
-    log_path = log_dir / f"trusted-dispatched-{iso_now}.json"
-    with open(log_path, "w") as f:
-        json.dump(dispatch_result, f, indent=2)
+    tasks = decompose_email_tasks(config, email_data, requester, classification)
+    if not tasks or len(tasks) <= 1:
+        # Unchanged single-task behavior (flag off, decomposition failed, or 1 task).
+        return _dispatch_one(
+            email_data.get("subject", "task"),
+            f"## Task\nHandle this work request. Category: {category}. "
+            "Complete the requested work and report back.\n\n",
+        )
 
-    # Unified queue: mirror this email-originated dispatch into change_requests so it
-    # shows up in the Change Log alongside Bill intake and gets the same Review / Accept
-    # / Revert lifecycle. Visibility only — the proven email dispatch/ack/CC path above
-    # is untouched. Best-effort: a failure here never blocks the dispatch.
-    crid = _mirror_email_to_change_request(
-        config, email_data, requester, tier, classification, repo_path, task_name, sender_email
-    )
-    if crid:
-        dispatch_result["change_request_id"] = crid
+    # Decomposed: dispatch ready build tasks independently; collect the rest.
+    dispatched, blocked = [], []
+    for t in tasks:
+        if t["ready"]:
+            targ = f" (targets: {', '.join(t['targets'])})" if t.get("targets") else ""
+            instr = (
+                "## Task\n"
+                "This email contains several requests, handled separately. Do ONLY this one:\n"
+                f"**{t['title']}**{targ}.\n"
+                "The full email is included above for context; do NOT do the other parts.\n"
+                f"Category: {category}. Complete this part and report back.\n\n"
+            )
+            label = f"{email_data.get('subject','task')} - {t['title']}"
+            dispatched.append((t, _dispatch_one(label, instr)))
+        else:
+            blocked.append(t)
 
-    # Register pending completion notification
-    _save_pending(config, {
-        "task_name": task_name,
-        "requester_from": sender_raw,
-        "requester_email": sender_email,
-        "extra_cc": extra_cc,
-        "subject": email_data.get("subject", ""),
-        "message_id": email_data.get("message_id", ""),
-        "references": email_data.get("references", ""),
-        "change_request_id": crid,
-        "repo_path": repo_path,
-        "head_before": head_before,
-        "dispatched_at": datetime.now().isoformat(),
-        "notified": False,
-    })
-
-    return dispatch_result
+    result = {
+        "type": "trusted_decomposed",
+        "requester": req_name, "tier": tier, "from": sender_raw,
+        "sender_email": sender_email, "subject": email_data.get("subject", ""),
+        "task_count": len(tasks),
+        "dispatched": [d[0]["title"] for d in dispatched],
+        "blocked": [{"title": t["title"], "needs": t["needs"], "kind": t["kind"]} for t in blocked],
+        "timestamp": datetime.now().isoformat(),
+    }
+    if blocked:
+        mm = _request_missing_material(blocked)
+        result["missing_material_result"] = mm.get("action_result")
+    mlog = log_dir / f"trusted-decomposed-{iso_now}.json"
+    with open(mlog, "w") as f:
+        json.dump(result, f, indent=2)
+    logging.info(f"[trusted/{req_name}] decomposed into {len(tasks)} tasks: "
+                 f"{len(dispatched)} dispatched, {len(blocked)} blocked")
+    return result
 
 
 # Keep old name as an alias so external callers still work.
@@ -2338,9 +2593,41 @@ def _process_one_request(config, r, changelog_url, forward_to):
             logging.error(f"[queue] approval email failed for {rid}: {e}")
 
 
+FATHOM_IMPORT_SCRIPT = os.path.expanduser(
+    "~/Projects/second-brain/scripts/fathom_import.py"
+)
+FATHOM_IMPORT_PYTHON = "/opt/homebrew/bin/python3"
+
+
+def run_fathom_import(logger, dry_run=False):
+    """Fold the Fathom meeting-summary importer into this daemon's existing
+    5-minute poll loop (~/Projects/second-brain/scripts/fathom_import.py).
+    Runs once per cycle, before the inbox scan below, so its own IMAP search
+    + state-file dedup always sees mail before the inbox loop's FETCH calls
+    flip the \\Seen flag. No LLM call — pure IMAP search + file write, cheap
+    enough to run every cycle."""
+    if dry_run:
+        return
+    try:
+        args = [FATHOM_IMPORT_PYTHON, FATHOM_IMPORT_SCRIPT]
+        proc = subprocess.run(args, capture_output=True, text=True, timeout=60)
+        if proc.returncode != 0:
+            logging.error(f"[fathom-import] exit {proc.returncode}: {proc.stderr[-500:]}")
+        else:
+            last_line = (proc.stdout or "").strip().splitlines()[-1] if proc.stdout.strip() else ""
+            logging.info(f"[fathom-import] {last_line}")
+    except Exception as e:
+        logging.error(f"[fathom-import] failed to run: {e}")
+
+
 def run_cycle(config, state, logger, dry_run=False):
     """Run one check cycle: fetch new emails + drafts, route, act."""
     results = []
+
+    # 0. Fathom meeting-summary import — own poller, own state file, run
+    #    first so it always sees mail before this cycle's inbox FETCH below
+    #    can flip \Seen on the same message.
+    run_fathom_import(logger, dry_run=dry_run)
 
     # 1. Check Claude's inbox
     try:
@@ -2352,6 +2639,17 @@ def run_cycle(config, state, logger, dry_run=False):
         logging.info(f"Found {len(new_emails)} new email(s) in Claude's inbox")
 
         for em in new_emails:
+            # Fathom meeting summaries short-circuit LLM routing entirely —
+            # the dedicated fathom_import.py poller (own cron job, own state
+            # file) owns turning these into vault notes. Here we just avoid
+            # burning an LLM routing call / risking a nonsense action on mail
+            # that isn't an instruction to Claude.
+            if FATHOM_SENDER_RE.search(em.get('from', '')):
+                logging.info(f"  [fathom/skip-routing] {em['subject'][:60]}")
+                results.append({"action": "fathom_skip_routing", "subject": em["subject"]})
+                state.mark_processed("inbox", em["stable_id"])
+                continue
+
             # Dispatch emails short-circuit LLM routing entirely
             if DISPATCH_SUBJECT_RE.match(em.get('subject', '')):
                 if not dry_run:
