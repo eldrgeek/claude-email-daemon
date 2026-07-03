@@ -41,6 +41,30 @@ second_opinion:
   model: opus            # claude CLI alias; resolves to current Opus (4.8-class)
   timeout_seconds: 120
 
+# --- Task decomposition (OFF by default) ---
+# When ON, a trusted-requester email may be split into several independently-fated
+# tasks: ready build tasks dispatch separately, and blocked ones (missing material
+# or needing diagnosis) trigger one threaded "here's what I need" reply to the
+# requester. OFF preserves the original single-task-per-email behavior exactly.
+# Can be overridden per-requester via `decompose_tasks: true` under a
+# trusted_requesters entry below.
+# decompose_tasks: false
+# decompose:
+#   model: opus            # defaults to second_opinion.model when unset
+#   timeout_seconds: 180
+
+# --- Provider data-export ingestion (zero-touch email→zip) ---
+# Anthropic/OpenAI/Google export-ready emails (forwarded from mw@ via Gmail
+# filter — see second-brain/docs/EXPORT-FORWARD-SETUP.md) are recognized and
+# their zips downloaded immediately (Anthropic links expire in 24h).
+# The URL allowlist is HARD-CODED in daemon.py (PROVIDER_EXPORTS) on purpose —
+# config cannot widen the set of hosts this daemon will download from.
+provider_exports:
+  enabled: true
+  max_download_gb: 6          # hard cap on any single export download
+  chrome_cdp: http://localhost:9222   # logged-in Chrome for auth-gated links (Takeout)
+  chrome_wait_seconds: 180    # how long to wait for a Chrome-initiated zip to land
+
 # --- Draft protocol ---
 # Drafts in Mike's Gmail with this subject prefix are treated as
 # instructions from Claude Web/Mobile

@@ -570,6 +570,463 @@ def handle_board_email(email_data, config, logger, trusted=False):
 
 
 # ---------------------------------------------------------------------------
+# Provider data-export ingestion — zero-touch email→zip (2026-07-03)
+# ---------------------------------------------------------------------------
+# All three chat providers (Anthropic claude.ai, OpenAI ChatGPT, Google
+# Takeout/Gemini) now deliver conversation exports as an emailed download link
+# (Anthropic's expires in 24h). A Gmail filter on mw@ forwards those emails to
+# claude@ (same pattern as Fathom — see second-brain/docs/EXPORT-FORWARD-SETUP.md)
+# and this handler downloads the zip immediately on receipt, into the location
+# the nightly import watches. Closes the last manual click in the export loop
+# (second-brain/docs/AUTOMATION-STATUS-2026-07-01.md follow-up #1 / WQ-44).
+#
+# SECURITY: this is an email-triggered downloader, so it is an attack surface.
+# The sender/subject match only selects candidates; the REAL gate is the
+# hard-coded URL allowlist below (per-provider legitimate download hosts,
+# https only, every redirect hop re-validated). It deliberately lives in code,
+# not config, so a config edit can't silently widen it. A zip magic-byte check
+# and a size cap guard the payload; downloads stream to disk (never held in
+# memory) and land as .part until complete.
+#
+# Two download strategies:
+#   1. direct  — streamed HTTPS GET. Works for signed one-shot URLs (OpenAI's
+#                Azure SAS link; possibly Anthropic's).
+#   2. chrome  — open the link in Mike's logged-in Chrome via CDP (:9222, the
+#                same Chrome the nightly export job drives) and wait for the
+#                zip to land in ~/Downloads. Needed for auth-gated links
+#                (Google Takeout requires the logged-in session) and used as
+#                fallback whenever the direct fetch doesn't yield a zip.
+
+EXPORT_DOWNLOADS_DIR = "~/Downloads"
+EXPORT_DROP_DIR = "~/Downloads/chat-exports"
+
+# Verified sender/subject/domain facts (2026-07-03):
+# - OpenAI: From "OpenAI <noreply@tm.openai.com>", subject
+#   "ChatGPT - Your data export is ready", direct signed link on
+#   proddatamgmtqueue.blob.core.windows.net (real archived email sample).
+# - Anthropic: subject "Your data is ready for download", link on claude.ai
+#   (from a working third-party ingester; exact sender local-part unverified —
+#   matched by domain).
+# - Google Takeout: From noreply@google.com, subject
+#   "Your Google data is ready to download", links via takeout.google.com
+#   (auth-gated → chrome strategy first).
+PROVIDER_EXPORTS = {
+    "claude": {
+        "label": "Claude.ai (Anthropic)",
+        "sender_domains": ("anthropic.com", "claude.ai", "claude.com"),
+        "subject_res": (
+            re.compile(r"your data .{0,30}ready", re.IGNORECASE),
+            re.compile(r"data export", re.IGNORECASE),
+        ),
+        "allowed_hosts": ("claude.ai", "claude.com", "anthropic.com"),
+        # Phase A of nightly_claude_export.sh scans this dir (content check:
+        # zip contains conversations.json) and imports at 03:10.
+        "dest_dir": EXPORT_DROP_DIR,
+        "prefix": "claude-export",
+        "next_step": ("tonight's 03:10 nightly import (Phase A of "
+                      "nightly_claude_export.sh) picks it up automatically"),
+    },
+    "chatgpt": {
+        "label": "ChatGPT (OpenAI)",
+        "sender_domains": ("openai.com", "tm.openai.com", "chatgpt.com"),
+        "subject_res": (
+            re.compile(r"data export is ready", re.IGNORECASE),
+            re.compile(r"your data export", re.IGNORECASE),
+        ),
+        "allowed_hosts": ("proddatamgmtqueue.blob.core.windows.net",),
+        # NOT the chat-exports root: a ChatGPT export also contains
+        # conversations.json, so Phase A's content check would misimport it as
+        # a Claude export. Subdirs are outside Phase A's -maxdepth 1 scan.
+        "dest_dir": EXPORT_DROP_DIR + "/chatgpt",
+        "prefix": "chatgpt-export",
+        # Legacy importer entry point (import-all.py) expects this exact path.
+        "stage_copy": "~/Projects/second-brain/imports/ChatGPT Export.zip",
+        "next_step": ("staged at second-brain/imports/ChatGPT Export.zip for "
+                      "the ChatGPT importer (import wiring is the remaining "
+                      "follow-up; the email→zip link was the blocker)"),
+    },
+    "gemini": {
+        "label": "Gemini (Google Takeout)",
+        "sender_domains": ("google.com",),
+        "subject_res": (
+            re.compile(r"google data .{0,30}(ready|download)", re.IGNORECASE),
+            re.compile(r"takeout", re.IGNORECASE),
+        ),
+        "allowed_hosts": (
+            "takeout.google.com",
+            "takeout-download.usercontent.google.com",
+            "apidata.googleusercontent.com",
+        ),
+        "dest_dir": EXPORT_DROP_DIR + "/gemini",
+        "prefix": "gemini-takeout",
+        # Takeout links are auth-gated: a bare GET bounces to accounts.google.com
+        # (off-allowlist → direct correctly hard-fails) so go via Chrome.
+        "prefer_chrome": True,
+        "next_step": ("saved for the Gemini/Takeout importer "
+                      "(canonical_import.py handles Gemini content)"),
+    },
+}
+
+_URL_ANGLE_RE = re.compile(r"<\s*(https?://[^>]+?)\s*>", re.S)
+_URL_HREF_RE = re.compile(r"""href\s*=\s*["']([^"']+)["']""", re.IGNORECASE)
+_URL_BARE_RE = re.compile(r"https?://[^\s<>\"']+")
+
+
+def _unwrap_redirector(url):
+    """Unwrap common forwarding/safelink redirectors (e.g. google.com/url?q=...).
+    Gmail auto-forward doesn't rewrite links, but manual forwards and some
+    clients do — always resolve to the innermost target before allowlisting."""
+    from urllib.parse import urlparse, parse_qs, unquote
+    for _ in range(3):
+        p = urlparse(url)
+        host = (p.hostname or "").lower()
+        if host in ("www.google.com", "google.com") and p.path == "/url":
+            q = parse_qs(p.query)
+            target = (q.get("q") or q.get("url") or [""])[0]
+            if target.startswith("http"):
+                url = unquote(target)
+                continue
+        break
+    return url
+
+
+def _extract_candidate_urls(email_data):
+    """Pull every plausible URL out of the email (plain + HTML bodies).
+    Handles angle-bracket-wrapped links that span lines (as in real provider
+    mail), HTML entities (&amp; inside the SAS query string), and redirector
+    wrapping. Returns deduped, cleaned URLs in discovery order."""
+    import html as _html
+    texts = [
+        email_data.get("body_full") or email_data.get("body") or "",
+        email_data.get("body_html") or "",
+    ]
+    raw = []
+    for text in texts:
+        if not text:
+            continue
+        for m in _URL_ANGLE_RE.finditer(text):
+            raw.append(re.sub(r"\s+", "", m.group(1)))
+        for m in _URL_HREF_RE.finditer(text):
+            raw.append(m.group(1))
+        for m in _URL_BARE_RE.finditer(text):
+            raw.append(m.group(0))
+    cleaned, seen = [], set()
+    for u in raw:
+        u = _html.unescape(u).strip().rstrip(">),.];'\"")
+        u = _unwrap_redirector(u)
+        if u.startswith("http") and u not in seen:
+            seen.add(u)
+            cleaned.append(u)
+    return cleaned
+
+
+def _export_host_allowed(url, allowed_hosts):
+    """True iff url is https and its host is (a subdomain of) an allowlisted
+    host. EXPORT_INGEST_EXTRA_ALLOWED_HOSTS (comma-sep, env) is a TEST-ONLY
+    seam — hosts listed there are accepted with any scheme so tests can run a
+    local http server; it is never set in the live launchd environment."""
+    from urllib.parse import urlparse
+    try:
+        p = urlparse(url)
+    except ValueError:
+        return False
+    host = (p.hostname or "").lower()
+    if not host:
+        return False
+    extra = tuple(
+        h.strip().lower()
+        for h in os.environ.get("EXPORT_INGEST_EXTRA_ALLOWED_HOSTS", "").split(",")
+        if h.strip()
+    )
+    if host in extra:
+        return True
+    if p.scheme != "https":
+        return False
+    return any(host == a or host.endswith("." + a) for a in allowed_hosts)
+
+
+def _pick_export_url(urls, provider_cfg):
+    """Choose the actual download link among allowlisted candidates (provider
+    emails also contain help-center/manage links). Highest score wins."""
+    allowed = [u for u in urls if _export_host_allowed(u, provider_cfg["allowed_hosts"])]
+    if not allowed:
+        return None
+
+    def score(u):
+        ul = u.lower()
+        s = 0
+        if ".zip" in ul:
+            s += 4
+        for kw in ("export", "download", "takeout"):
+            if kw in ul:
+                s += 1
+        return s
+
+    return max(allowed, key=score)
+
+
+def _match_provider_export(email_data, config):
+    """Return a PROVIDER_EXPORTS key if this email is a provider data-export
+    notification, else None.
+
+    Primary match: sender domain + subject. Fallback (manual forwards, where
+    From: becomes Mike's own address): allowlisted sender + subject match +
+    at least one URL on that provider's download allowlist. The URL allowlist
+    stays the real gate either way."""
+    sender_raw = email_data.get("from", "")
+    m = re.search(r"<([^>]+)>", sender_raw)
+    sender = (m.group(1) if m else sender_raw).strip().lower()
+    domain = sender.rsplit("@", 1)[-1]
+    subject = email_data.get("subject", "") or ""
+
+    for key, cfg in PROVIDER_EXPORTS.items():
+        dom_ok = any(domain == d or domain.endswith("." + d) for d in cfg["sender_domains"])
+        if dom_ok and any(r.search(subject) for r in cfg["subject_res"]):
+            return key
+
+    trusted = [s.lower() for s in config.get("dispatch", {}).get("allowed_senders", [])]
+    if sender in trusted:
+        urls = _extract_candidate_urls(email_data)
+        for key, cfg in PROVIDER_EXPORTS.items():
+            if any(r.search(subject) for r in cfg["subject_res"]):
+                if any(_export_host_allowed(u, cfg["allowed_hosts"]) for u in urls):
+                    return key
+    return None
+
+
+def _stream_export_download(url, dest_path, allowed_hosts, max_bytes):
+    """Streamed download with per-hop redirect validation and zip sniffing.
+    Returns (bytes_written, None) on success or (None, reason) on failure.
+    Never buffers the payload in memory; writes to <dest>.part then renames."""
+    from urllib.parse import urljoin
+    current = url
+    part = dest_path + ".part"
+    try:
+        for _ in range(5):
+            resp = requests.get(
+                current, stream=True, allow_redirects=False, timeout=(15, 120),
+                headers={"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)"},
+            )
+            if resp.status_code in (301, 302, 303, 307, 308):
+                loc = urljoin(current, resp.headers.get("Location", ""))
+                if not _export_host_allowed(loc, allowed_hosts):
+                    return None, f"redirect to non-allowlisted URL: {loc[:160]}"
+                current = loc
+                continue
+            if resp.status_code != 200:
+                return None, f"HTTP {resp.status_code} from {current[:120]}"
+            written = 0
+            first_bytes = b""
+            with open(part, "wb") as fh:
+                for chunk in resp.iter_content(chunk_size=1024 * 1024):
+                    if not chunk:
+                        continue
+                    if not first_bytes:
+                        first_bytes = chunk[:4]
+                    written += len(chunk)
+                    if written > max_bytes:
+                        return None, f"size cap exceeded ({max_bytes} bytes)"
+                    fh.write(chunk)
+            if written == 0 or not first_bytes.startswith(b"PK"):
+                return None, "response is not a zip (auth wall or error page?)"
+            os.replace(part, dest_path)
+            return written, None
+        return None, "too many redirects"
+    except requests.RequestException as e:
+        return None, f"download error: {e}"
+    finally:
+        if os.path.exists(part):
+            try:
+                os.remove(part)
+            except OSError:
+                pass
+
+
+def _chrome_download_export(url, cdp_base, timeout_s=180):
+    """Open url in Mike's logged-in Chrome (CDP) and wait for a new zip to
+    finish landing in ~/Downloads. Returns the zip path, or None. Used for
+    auth-gated links (Google Takeout) and as fallback for the direct path.
+    The URL passed here has ALREADY passed the allowlist."""
+    from urllib.parse import quote
+    downloads = os.path.expanduser(EXPORT_DOWNLOADS_DIR)
+    start_ts = time.time()
+    tab_id = None
+    try:
+        endpoint = f"{cdp_base}/json/new?{'url=' + quote(url, safe='')}"
+        resp = requests.put(endpoint, timeout=10)
+        if resp.status_code == 405:  # older Chrome wants GET
+            resp = requests.get(endpoint, timeout=10)
+        if resp.ok:
+            tab_id = resp.json().get("id")
+    except Exception as e:
+        logging.warning(f"[export-ingest] Chrome CDP unavailable: {e}")
+        return None
+
+    found = None
+    try:
+        deadline = start_ts + timeout_s
+        while time.time() < deadline:
+            for name in os.listdir(downloads):
+                if not name.lower().endswith(".zip"):
+                    continue
+                p = os.path.join(downloads, name)
+                try:
+                    if os.path.getmtime(p) < start_ts - 2:
+                        continue
+                except OSError:
+                    continue
+                if os.path.exists(p + ".crdownload") or os.path.exists(
+                        os.path.join(downloads, name + ".crdownload")):
+                    continue
+                # size-stable check: still being written?
+                s1 = os.path.getsize(p)
+                time.sleep(2)
+                if os.path.getsize(p) != s1:
+                    continue
+                found = p
+                break
+            if found:
+                break
+            time.sleep(3)
+    finally:
+        if tab_id:
+            try:
+                requests.get(f"{cdp_base}/json/close/{tab_id}", timeout=5)
+            except Exception:
+                pass
+    return found
+
+
+def handle_provider_export_email(email_data, config, logger):
+    """Handle a provider data-export email: extract the download link, verify
+    it against the hard allowlist, fetch the zip (direct stream or logged-in
+    Chrome), place it where the import pipeline watches, and confirm to Mike.
+    Returns a result dict, or None if this isn't a provider-export email.
+    Called before LLM routing — short-circuits like dispatch/board/Fathom."""
+    pe_cfg = config.get("provider_exports", {}) or {}
+    if not pe_cfg.get("enabled", True):
+        return None
+    provider = _match_provider_export(email_data, config)
+    if provider is None:
+        return None
+
+    cfg = PROVIDER_EXPORTS[provider]
+    iso_now = datetime.now().strftime("%Y%m%dT%H%M%S")
+    log_dir = Path(os.path.expanduser(config["log_dir"]))
+    log_dir.mkdir(parents=True, exist_ok=True)
+    forward_to = config["forward_to"]
+    max_bytes = int(float(pe_cfg.get("max_download_gb", 6)) * 1024 ** 3)
+    cdp_base = pe_cfg.get("chrome_cdp", "http://localhost:9222")
+
+    result = {
+        "type": "provider_export",
+        "provider": provider,
+        "from": email_data.get("from", ""),
+        "subject": email_data.get("subject", ""),
+        "timestamp": datetime.now().isoformat(),
+    }
+
+    def _finish(status, detail, zip_path=None, notify_subject=None, notify_body=None):
+        result["result"] = status
+        result["detail"] = detail
+        if zip_path:
+            result["zip_path"] = str(zip_path)
+        log_path = log_dir / f"export-ingest-{iso_now}-{provider}.json"
+        with open(log_path, "w") as f:
+            json.dump(result, f, indent=2)
+        if notify_subject:
+            try:
+                send_email(config, forward_to, notify_subject, notify_body)
+            except Exception as e:
+                logging.error(f"[export-ingest] failed to send notification: {e}")
+        logging.info(f"[export-ingest] {provider}: {status} — {detail[:160]}")
+        return result
+
+    urls = _extract_candidate_urls(email_data)
+    url = _pick_export_url(urls, cfg)
+    if url is None:
+        from urllib.parse import urlparse
+        hosts = sorted({(urlparse(u).hostname or "?") for u in urls})
+        return _finish(
+            "no_allowlisted_link",
+            f"candidate hosts: {', '.join(hosts) or '(none)'}",
+            notify_subject=f"[export-ingest] {cfg['label']}: no allowlisted download link",
+            notify_body=(
+                f"A {cfg['label']} export email arrived but none of its links matched the "
+                f"download allowlist {cfg['allowed_hosts']}.\n\n"
+                f"Candidate link hosts found: {', '.join(hosts) or '(none)'}\n\n"
+                "If one of those is the provider's real download host, extend "
+                "PROVIDER_EXPORTS in claude-email-daemon/daemon.py. Original subject: "
+                f"{email_data.get('subject', '')}"
+            ),
+        )
+    result["url_host"] = url.split("/")[2] if "://" in url else ""
+
+    dest_dir = os.path.expanduser(cfg["dest_dir"])
+    os.makedirs(dest_dir, exist_ok=True)
+    dest_path = os.path.join(dest_dir, f"{cfg['prefix']}-{iso_now}.zip")
+
+    size, err = (None, "skipped (auth-gated provider — going via Chrome)")
+    strategy = None
+    if not cfg.get("prefer_chrome"):
+        size, err = _stream_export_download(url, dest_path, cfg["allowed_hosts"], max_bytes)
+        if size:
+            strategy = "direct"
+    if not strategy:
+        if err:
+            logging.info(f"[export-ingest] {provider}: direct fetch — {err}; trying Chrome")
+        got = _chrome_download_export(url, cdp_base,
+                                      timeout_s=int(pe_cfg.get("chrome_wait_seconds", 180)))
+        if got:
+            try:
+                shutil.move(got, dest_path)
+                size = os.path.getsize(dest_path)
+                strategy = "chrome"
+            except OSError as e:
+                return _finish("move_failed", f"downloaded to {got} but move failed: {e}")
+
+    if not strategy:
+        return _finish(
+            "download_failed", f"direct: {err}; chrome: no zip landed",
+            notify_subject=f"[export-ingest] {cfg['label']}: download FAILED",
+            notify_body=(
+                f"A {cfg['label']} export email arrived but the automatic download failed.\n\n"
+                f"Direct fetch: {err}\n"
+                "Chrome fallback: no zip appeared in ~/Downloads within the wait window "
+                "(Chrome not running with --remote-debugging-port=9222, or the link needs "
+                "an interactive login step).\n\n"
+                f"Manual fallback — the (allowlisted) link from the email:\n{url}\n\n"
+                "Anthropic links expire 24h after the export email."
+            ),
+        )
+
+    # Staging copy for importers that expect a fixed path (ChatGPT legacy importer).
+    stage = cfg.get("stage_copy")
+    if stage:
+        try:
+            stage_path = os.path.expanduser(stage)
+            os.makedirs(os.path.dirname(stage_path), exist_ok=True)
+            shutil.copy2(dest_path, stage_path)
+            result["stage_copy"] = stage_path
+        except OSError as e:
+            logging.warning(f"[export-ingest] stage copy failed: {e}")
+
+    size_mb = round(size / (1024 * 1024), 1)
+    return _finish(
+        "downloaded", f"{dest_path} ({size_mb} MB, via {strategy})", zip_path=dest_path,
+        notify_subject=f"[export-ingest] {cfg['label']} export downloaded ({size_mb} MB)",
+        notify_body=(
+            f"Zero-touch export ingestion succeeded.\n\n"
+            f"Provider: {cfg['label']}\n"
+            f"Saved to: {dest_path}\n"
+            f"Size: {size_mb} MB (via {strategy})\n\n"
+            f"Next: {cfg['next_step']}.\n\n"
+            "No action needed."
+        ),
+    )
+
+
+# ---------------------------------------------------------------------------
 # State tracking — never process the same message twice
 # ---------------------------------------------------------------------------
 
@@ -657,6 +1114,24 @@ def extract_body(msg):
                 if payload:
                     return payload.decode("utf-8", errors="replace")
     else:
+        payload = msg.get_payload(decode=True)
+        if payload:
+            return payload.decode("utf-8", errors="replace")
+    return ""
+
+
+def extract_html_body(msg):
+    """Extract the text/html body from an email message (or '' if none).
+
+    The provider-export handler needs this: some providers put the download
+    link only in the HTML part, and extract_body() prefers text/plain."""
+    if msg.is_multipart():
+        for part in msg.walk():
+            if part.get_content_type() == "text/html":
+                payload = part.get_payload(decode=True)
+                if payload:
+                    return payload.decode("utf-8", errors="replace")
+    elif msg.get_content_type() == "text/html":
         payload = msg.get_payload(decode=True)
         if payload:
             return payload.decode("utf-8", errors="replace")
@@ -855,6 +1330,11 @@ def fetch_new_emails(imap_server, address, password, state, source="inbox"):
             "subject": decode_subject(msg["Subject"]),
             "date": msg["Date"] or "",
             "body": extract_body(msg)[:2000],  # Truncate long bodies
+            # Untruncated bodies for handlers that need the whole thing (the
+            # provider-export download link is routinely past the 2000-char cut,
+            # or present only in the HTML part).
+            "body_full": extract_body(msg),
+            "body_html": extract_html_body(msg),
             "attachments": attachments,
             "references": msg.get("References", ""),
             "authentication_results": msg.get("Authentication-Results", ""),
@@ -2647,6 +3127,20 @@ def run_cycle(config, state, logger, dry_run=False):
             if FATHOM_SENDER_RE.search(em.get('from', '')):
                 logging.info(f"  [fathom/skip-routing] {em['subject'][:60]}")
                 results.append({"action": "fathom_skip_routing", "subject": em["subject"]})
+                state.mark_processed("inbox", em["stable_id"])
+                continue
+
+            # Provider data-export emails (Anthropic / OpenAI / Google Takeout,
+            # forwarded from mw@ by Gmail filter) short-circuit LLM routing —
+            # download the zip immediately (Anthropic links expire in 24h).
+            if _match_provider_export(em, config):
+                if not dry_run:
+                    export_result = handle_provider_export_email(em, config, logger)
+                    results.append(export_result or {})
+                    logging.info(f"  [export-ingest] {em['subject'][:60]}")
+                else:
+                    logging.info(f"  [export-ingest/dry-run] {em['subject'][:60]}")
+                    results.append({"action": "export_ingest_dry_run", "subject": em["subject"]})
                 state.mark_processed("inbox", em["stable_id"])
                 continue
 
