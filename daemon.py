@@ -446,6 +446,116 @@ def handle_dispatch_email(email_data, config, logger):
 
 
 # ---------------------------------------------------------------------------
+# Board routing — [BOARD] subject pattern
+# ---------------------------------------------------------------------------
+# Cross-surface intake into the SOMA board (~/Projects/SOMA/board/inbox/).
+# Any allowlisted sender (same allowlist as dispatch) can file a board card by
+# email — this is how claude.ai web/mobile/CDC/CCw sessions without local
+# filesystem access get an item onto the board. Unlike dispatch, this is pure
+# file-write + confirmation: no shell-out, no cc-dispatch, no LLM routing.
+
+BOARD_SUBJECT_RE = re.compile(r'^\[BOARD\]\s*(.*)', re.IGNORECASE)
+
+BOARD_INBOX_DIR = '~/Projects/SOMA/board/inbox'
+
+
+def _slugify(text, max_len=60):
+    slug = re.sub(r'[^a-z0-9]+', '-', text.lower()).strip('-')
+    return (slug or 'untitled')[:max_len].strip('-')
+
+
+def handle_board_email(email_data, config, logger, trusted=False):
+    """
+    Handle [BOARD] emails: file the body as a card in the SOMA board inbox.
+    Returns a board log dict, or None if subject doesn't match.
+    Called before LLM routing — short-circuits normal flow on match, same as
+    handle_dispatch_email. Reuses dispatch.allowed_senders (same trust surface)
+    for the inbox channel. `trusted=True` skips the allowlist check — used for
+    Mike's own already-authenticated drafts folder (mikeai@), which isn't on
+    the inbox sender allowlist but is inherently trusted (password-gated Gmail
+    account, not an arbitrary inbound sender).
+    """
+    dispatch_cfg = config.get('dispatch', {})
+    subject = email_data.get('subject', '')
+    m = BOARD_SUBJECT_RE.match(subject)
+    if not m:
+        return None
+
+    title_raw = m.group(1).strip() or 'untitled'
+
+    sender_raw = email_data.get('from', '')
+    m_addr = re.search(r'<([^>]+)>', sender_raw)
+    sender_email = m_addr.group(1).strip().lower() if m_addr else sender_raw.strip().lower()
+
+    allowed = [s.lower() for s in dispatch_cfg.get('allowed_senders', [])]
+    board_log = {
+        'type': 'board',
+        'from': sender_raw,
+        'sender_email': sender_email,
+        'subject': subject,
+        'title': title_raw,
+        'timestamp': datetime.now().isoformat(),
+    }
+
+    if not trusted and sender_email not in allowed:
+        board_log['result'] = 'rejected:sender_not_allowlisted'
+        logging.warning(f"Board card rejected (sender_not_allowlisted): {sender_email}")
+        try:
+            send_email(config, sender_raw, f'Re: {subject}',
+                       'Board card refused: sender not on allowlist.',
+                       in_reply_to=email_data.get('message_id'),
+                       references=email_data.get('references'))
+        except Exception as e:
+            logging.error(f"Failed to send board rejection reply: {e}")
+        return board_log
+
+    inbox_dir = Path(os.path.expanduser(BOARD_INBOX_DIR))
+    (inbox_dir / 'processed').mkdir(parents=True, exist_ok=True)
+
+    now = datetime.now()
+    slug = _slugify(title_raw)
+    filename = f"{now.strftime('%Y-%m-%d')}-{slug}.md"
+    card_path = inbox_dir / filename
+    # Avoid clobbering same-day/same-slug cards from a prior email.
+    suffix = 2
+    while card_path.exists():
+        card_path = inbox_dir / f"{now.strftime('%Y-%m-%d')}-{slug}-{suffix}.md"
+        suffix += 1
+
+    body = email_data.get('body', '')
+    card = (
+        "---\n"
+        f"source-surface: email\n"
+        f"source-sender: {sender_email}\n"
+        f"received-at: {now.isoformat()}\n"
+        f"needs-mike: false\n"
+        "---\n\n"
+        f"# {title_raw}\n\n"
+        f"{body}\n"
+    )
+    card_path.write_text(card)
+    logging.info(f"[board] card filed: {card_path}")
+
+    board_log['result'] = 'filed'
+    board_log['card_path'] = str(card_path)
+
+    # For the drafts channel (trusted=True), sender_raw is Mike's own mikeai@
+    # account — replying there is inert since nobody reads that inbox. Confirm
+    # to forward_to (Mike's real inbox) instead. For the normal inbox channel,
+    # reply directly to the sender as usual.
+    confirm_to = config.get('forward_to') if trusted else sender_raw
+    try:
+        send_email(config, confirm_to, f'Re: {subject}',
+                   f'Board card filed: {title_raw}',
+                   in_reply_to=email_data.get('message_id'),
+                   references=email_data.get('references'))
+    except Exception as e:
+        logging.error(f"Failed to send board confirmation reply: {e}")
+
+    return board_log
+
+
+# ---------------------------------------------------------------------------
 # State tracking — never process the same message twice
 # ---------------------------------------------------------------------------
 
@@ -2254,6 +2364,18 @@ def run_cycle(config, state, logger, dry_run=False):
                 state.mark_processed("inbox", em["stable_id"])
                 continue
 
+            # Board emails short-circuit LLM routing entirely — file a card, confirm, done
+            if BOARD_SUBJECT_RE.match(em.get('subject', '')):
+                if not dry_run:
+                    board_result = handle_board_email(em, config, logger)
+                    results.append(board_result or {})
+                    logging.info(f"  [board] {em['subject'][:60]}")
+                else:
+                    logging.info(f"  [board/dry-run] {em['subject'][:60]}")
+                    results.append({"action": "board_dry_run", "subject": em["subject"]})
+                state.mark_processed("inbox", em["stable_id"])
+                continue
+
             # Trusted-requester pipeline: check before general LLM routing
             trusted_result = handle_trusted_email(em, config, logger) if not dry_run else None
             if trusted_result is not None:
@@ -2308,6 +2430,20 @@ def run_cycle(config, state, logger, dry_run=False):
                 _auth_alert_path.unlink()
 
             for draft in drafts:
+                # Board drafts short-circuit like board inbox emails: file a card, no LLM routing.
+                # Covers a CCw/CDC session composing a draft in Mike's Gmail as a board note.
+                if BOARD_SUBJECT_RE.match(draft.get('subject', '')):
+                    draft.setdefault('from', mike_cfg.get('address', 'mikeai'))
+                    board_result = handle_board_email(draft, config, logger, trusted=True) if not dry_run else None
+                    if not dry_run:
+                        results.append(board_result or {})
+                        logging.info(f"  [board/draft] {draft['subject'][:60]}")
+                    else:
+                        results.append({"action": "board_dry_run", "subject": draft["subject"]})
+                        logging.info(f"  [board/draft/dry-run] {draft['subject'][:60]}")
+                    state.mark_processed("drafts", draft["stable_id"])
+                    continue
+
                 email_text = f"Subject: {draft['subject']}\n\n{draft['body']}"
                 decision = route_email(config, email_text)
                 decision["action"] = "execute_draft"  # Override — drafts are always instructions
