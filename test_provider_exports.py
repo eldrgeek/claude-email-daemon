@@ -82,6 +82,9 @@ check("userinfo-spoof rejected", not D._export_host_allowed("https://claude.ai@e
 # ---------------------------------------------------------------------------
 print("== provider matching ==")
 cfg = D.load_config()
+# Keep test artifacts out of the live logs/ dir (the handler writes a JSON
+# result file per event into config log_dir).
+cfg["log_dir"] = tempfile.mkdtemp(prefix="export-ingest-test-logs-")
 
 em_openai = {"from": "OpenAI <noreply@tm.openai.com>",
              "subject": "ChatGPT - Your data export is ready", "body_full": OPENAI_BODY}
