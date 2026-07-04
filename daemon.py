@@ -619,6 +619,14 @@ PROVIDER_EXPORTS = {
             re.compile(r"data export", re.IGNORECASE),
         ),
         "allowed_hosts": ("claude.ai", "claude.com", "anthropic.com"),
+        # 2026-07-04: the emailed link lands on an authenticated claude.ai PAGE
+        # (not a signed one-shot zip URL) that needs a UI click to start the
+        # download — a raw GET (direct strategy) always hits the app shell/auth
+        # wall, and a passive CDP tab-open never triggers anything. Route
+        # through Yeshie (which clicks) and gate to the overnight window since
+        # it's a visible-tab action in Mike's real Chrome. See
+        # yeshie/sites/claude.ai/tasks/export-download.payload.json.
+        "needs_click_download": True,
         # Phase A of nightly_claude_export.sh scans this dir (content check:
         # zip contains conversations.json) and imports at 03:10.
         "dest_dir": EXPORT_DROP_DIR,
@@ -842,11 +850,156 @@ def _stream_export_download(url, dest_path, allowed_hosts, max_bytes):
                 pass
 
 
+def _in_overnight_window(pe_cfg):
+    """True iff local time is inside the configured overnight window (default
+    03:00-04:00, matching nightly_claude_export.sh's 03:10 Phase B slot).
+    EXPORT_INGEST_FORCE_WINDOW=1 (env, test-only) bypasses the gate so the
+    fix can be verified without waiting for the real window."""
+    if os.environ.get("EXPORT_INGEST_FORCE_WINDOW") == "1":
+        return True
+    start_h = int(pe_cfg.get("overnight_window_start_hour", 3))
+    end_h = int(pe_cfg.get("overnight_window_end_hour", 4))
+    hour = datetime.now().hour
+    if start_h <= end_h:
+        return start_h <= hour < end_h
+    return hour >= start_h or hour < end_h  # wraps midnight
+
+
+def _pending_exports_path(config):
+    state_dir = Path(os.path.expanduser(config["state_file"])).parent
+    state_dir.mkdir(parents=True, exist_ok=True)
+    return state_dir / "export-pending-queue.json"
+
+
+def _load_pending_exports(config):
+    path = _pending_exports_path(config)
+    if path.exists():
+        try:
+            with open(path) as f:
+                return json.load(f)
+        except (json.JSONDecodeError, OSError):
+            return []
+    return []
+
+
+def _save_pending_exports(config, items):
+    path = _pending_exports_path(config)
+    with open(path, "w") as f:
+        json.dump(items, f, indent=2)
+
+
+def _queue_export_for_overnight(config, provider, url, cfg, email_subject):
+    """Persist a Chrome/Yeshie-needing export so it survives past this poll
+    cycle. Called when the export arrives outside the overnight window —
+    the daemon does NOT try to drive Mike's daytime Chrome. Anthropic links
+    expire in 24h, well outside any single day/night gap, so one overnight
+    window is always reachable before expiry."""
+    items = _load_pending_exports(config)
+    entry = {
+        "provider": provider,
+        "url": url,
+        "queued_at": datetime.now().isoformat(),
+        "subject": email_subject,
+        "attempts": 0,
+    }
+    items.append(entry)
+    _save_pending_exports(config, items)
+    return entry
+
+
+def _yeshie_download_export(url, config, pe_cfg, dest_dir, prefix):
+    """Drive the export-ready link through the Yeshie relay (the same
+    extension-driven mechanism that already requests the export unattended
+    every night) instead of a passive CDP tab-open + poll. Anthropic's link
+    lands on an authenticated claude.ai PAGE that requires a UI click to
+    start the actual browser download — see
+    yeshie/sites/claude.ai/tasks/export-download.payload.json _meta for the
+    root-cause note. Returns (zip_path, None) or (None, reason)."""
+    relay = pe_cfg.get("yeshie_relay", "http://localhost:3333")
+    payload_path = os.path.expanduser(pe_cfg.get(
+        "yeshie_download_payload",
+        "~/Projects/yeshie/sites/claude.ai/tasks/export-download.payload.json"))
+    if not os.path.exists(payload_path):
+        return None, f"yeshie payload not found at {payload_path}"
+
+    try:
+        status = requests.get(f"{relay}/status", timeout=5).json()
+    except Exception as e:
+        return None, f"yeshie relay unreachable: {e}"
+    if not (status.get("ok") and status.get("extensionConnected")):
+        return None, f"yeshie relay not ready: {status}"
+
+    try:
+        with open(payload_path) as f:
+            payload = json.load(f)
+    except (OSError, json.JSONDecodeError) as e:
+        return None, f"could not read yeshie payload: {e}"
+
+    downloads = os.path.expanduser(EXPORT_DOWNLOADS_DIR)
+    start_ts = time.time()
+    timeout_s = int(pe_cfg.get("yeshie_run_timeout_seconds", 60))
+    try:
+        resp = requests.post(
+            f"{relay}/run",
+            json={"payload": payload, "params": {"export_url": url}, "tabId": None,
+                  "timeoutMs": timeout_s * 1000},
+            timeout=timeout_s + 15,
+        )
+    except requests.RequestException as e:
+        return None, f"yeshie /run request failed: {e}"
+    if resp.status_code != 200:
+        return None, f"yeshie /run HTTP {resp.status_code}: {resp.text[:200]}"
+    result = resp.json() if resp.content else {}
+    if result.get("success") is False:
+        return None, f"yeshie chain failed: {str(result.get('error') or result)[:200]}"
+
+    # The chain's job was to trigger the browser download; confirm it landed
+    # the same way the pre-fix Chrome fallback confirmed (poll ~/Downloads
+    # for a new, stable, non-partial zip since the chain started).
+    deadline = start_ts + max(30, pe_cfg.get("chrome_wait_seconds", 180))
+    found = None
+    while time.time() < deadline:
+        for name in os.listdir(downloads):
+            if not name.lower().endswith(".zip"):
+                continue
+            p = os.path.join(downloads, name)
+            try:
+                if os.path.getmtime(p) < start_ts - 2:
+                    continue
+            except OSError:
+                continue
+            if os.path.exists(p + ".crdownload"):
+                continue
+            s1 = os.path.getsize(p)
+            time.sleep(2)
+            try:
+                if os.path.getsize(p) != s1:
+                    continue
+            except OSError:
+                continue
+            found = p
+            break
+        if found:
+            break
+        time.sleep(3)
+
+    if not found:
+        return None, ("yeshie chain ran (result: "
+                       f"{str(result)[:160]}) but no zip landed in ~/Downloads")
+    return found, None
+
+
 def _chrome_download_export(url, cdp_base, timeout_s=180):
     """Open url in Mike's logged-in Chrome (CDP) and wait for a new zip to
     finish landing in ~/Downloads. Returns the zip path, or None. Used for
     auth-gated links (Google Takeout) and as fallback for the direct path.
-    The URL passed here has ALREADY passed the allowlist."""
+    The URL passed here has ALREADY passed the allowlist.
+
+    NOTE (2026-07-04): kept as a fallback for providers whose page DOES
+    auto-download on load (e.g. a future Anthropic flow change, or Takeout
+    if it ever stops needing a click). For claude.ai's current click-required
+    page, prefer _yeshie_download_export() — see its docstring for why this
+    passive approach silently failed the one real test (07-03 14:09)."""
     from urllib.parse import quote
     downloads = os.path.expanduser(EXPORT_DOWNLOADS_DIR)
     start_ts = time.time()
@@ -972,7 +1125,47 @@ def handle_provider_export_email(email_data, config, logger):
         size, err = _stream_export_download(url, dest_path, cfg["allowed_hosts"], max_bytes)
         if size:
             strategy = "direct"
-    if not strategy:
+
+    # needs_click_download: the provider's link lands on an authenticated
+    # PAGE that requires a UI click to start the browser download (true for
+    # claude.ai as of 2026-07 — see export-download.payload.json _meta).
+    # Driving that click opens a visible tab in Mike's real Chrome, so it's
+    # gated to the overnight window; outside it, queue rather than attempt
+    # against his daytime browser or silently drop the one-shot link.
+    if not strategy and cfg.get("needs_click_download"):
+        if not _in_overnight_window(pe_cfg):
+            _queue_export_for_overnight(config, provider, url, cfg, email_data.get("subject", ""))
+            return _finish(
+                "queued_for_overnight",
+                f"direct: {err}; deferred to overnight window "
+                f"({pe_cfg.get('overnight_window_start_hour', 3):02d}:00-"
+                f"{pe_cfg.get('overnight_window_end_hour', 4):02d}:00) — "
+                "not driving Chrome during the day",
+                notify_subject=f"[export-ingest] {cfg['label']}: queued for tonight's overnight window",
+                notify_body=(
+                    f"A {cfg['label']} export email arrived. Direct fetch failed ({err}), "
+                    "as expected — this provider's link needs a logged-in browser click, not "
+                    "just a raw HTTP GET.\n\n"
+                    "Rather than pop a tab into your Chrome during the day, the download is "
+                    f"queued and will run automatically in tonight's "
+                    f"{pe_cfg.get('overnight_window_start_hour', 3):02d}:00-"
+                    f"{pe_cfg.get('overnight_window_end_hour', 4):02d}:00 window "
+                    "(same window nightly_claude_export.sh already uses). No action needed — "
+                    f"the link is good for 24h from send. Queue file: {_pending_exports_path(config)}"
+                ),
+            )
+        got, yerr = _yeshie_download_export(url, config, pe_cfg, dest_dir, cfg["prefix"])
+        if got:
+            try:
+                shutil.move(got, dest_path)
+                size = os.path.getsize(dest_path)
+                strategy = "yeshie"
+            except OSError as e:
+                return _finish("move_failed", f"downloaded to {got} but move failed: {e}")
+        else:
+            err = f"{err}; yeshie: {yerr}"
+
+    if not strategy and not cfg.get("needs_click_download"):
         if err:
             logging.info(f"[export-ingest] {provider}: direct fetch — {err}; trying Chrome")
         got = _chrome_download_export(url, cdp_base,
@@ -984,17 +1177,16 @@ def handle_provider_export_email(email_data, config, logger):
                 strategy = "chrome"
             except OSError as e:
                 return _finish("move_failed", f"downloaded to {got} but move failed: {e}")
+        elif err:
+            err = f"{err}; chrome: no zip landed"
 
     if not strategy:
         return _finish(
-            "download_failed", f"direct: {err}; chrome: no zip landed",
+            "download_failed", err or "download failed (no strategy succeeded)",
             notify_subject=f"[export-ingest] {cfg['label']}: download FAILED",
             notify_body=(
                 f"A {cfg['label']} export email arrived but the automatic download failed.\n\n"
-                f"Direct fetch: {err}\n"
-                "Chrome fallback: no zip appeared in ~/Downloads within the wait window "
-                "(Chrome not running with --remote-debugging-port=9222, or the link needs "
-                "an interactive login step).\n\n"
+                f"{err}\n\n"
                 f"Manual fallback — the (allowlisted) link from the email:\n{url}\n\n"
                 "Anthropic links expire 24h after the export email."
             ),
@@ -3100,9 +3292,101 @@ def run_fathom_import(logger, dry_run=False):
         logging.error(f"[fathom-import] failed to run: {e}")
 
 
+def run_pending_exports(config, logger, dry_run=False):
+    """Retry any provider-export downloads that were queued for the overnight
+    window (see _queue_export_for_overnight). Runs every poll cycle but only
+    ACTS once _in_overnight_window() is true — outside the window this is a
+    cheap no-op read of the queue file, so it's safe to call unconditionally
+    from the main loop rather than needing its own launchd job."""
+    if dry_run:
+        return
+    pe_cfg = config.get("provider_exports", {}) or {}
+    if not pe_cfg.get("enabled", True):
+        return
+    items = _load_pending_exports(config)
+    if not items:
+        return
+    if not _in_overnight_window(pe_cfg):
+        return
+
+    remaining = []
+    for entry in items:
+        provider = entry.get("provider")
+        cfg = PROVIDER_EXPORTS.get(provider)
+        if not cfg:
+            logging.warning(f"[export-ingest/pending] unknown provider '{provider}', dropping entry")
+            continue
+        entry["attempts"] = entry.get("attempts", 0) + 1
+        url = entry["url"]
+        iso_now = datetime.now().strftime("%Y%m%dT%H%M%S")
+        log_dir = Path(os.path.expanduser(config["log_dir"]))
+        log_dir.mkdir(parents=True, exist_ok=True)
+        dest_dir = os.path.expanduser(cfg["dest_dir"])
+        os.makedirs(dest_dir, exist_ok=True)
+        dest_path = os.path.join(dest_dir, f"{cfg['prefix']}-{iso_now}.zip")
+
+        got, yerr = _yeshie_download_export(url, config, pe_cfg, dest_dir, cfg["prefix"])
+        result = {
+            "type": "provider_export_pending_retry",
+            "provider": provider,
+            "queued_at": entry.get("queued_at"),
+            "attempts": entry["attempts"],
+            "timestamp": datetime.now().isoformat(),
+        }
+        if got:
+            try:
+                shutil.move(got, dest_path)
+                size_mb = round(os.path.getsize(dest_path) / (1024 * 1024), 1)
+                result["result"] = "downloaded"
+                result["zip_path"] = dest_path
+                logging.info(f"[export-ingest/pending] {provider}: downloaded {dest_path} ({size_mb} MB)")
+                stage = cfg.get("stage_copy")
+                if stage:
+                    try:
+                        stage_path = os.path.expanduser(stage)
+                        os.makedirs(os.path.dirname(stage_path), exist_ok=True)
+                        shutil.copy2(dest_path, stage_path)
+                    except OSError as e:
+                        logging.warning(f"[export-ingest/pending] stage copy failed: {e}")
+                try:
+                    send_email(
+                        config, config["forward_to"],
+                        f"[export-ingest] {cfg['label']} export downloaded ({size_mb} MB, overnight)",
+                        f"Zero-touch export ingestion succeeded (queued earlier, ran in the "
+                        f"overnight window).\n\nSaved to: {dest_path}\nSize: {size_mb} MB\n\n"
+                        f"Next: {cfg['next_step']}.\n\nNo action needed.",
+                    )
+                except Exception as e:
+                    logging.error(f"[export-ingest/pending] failed to send notification: {e}")
+            except OSError as e:
+                result["result"] = "move_failed"
+                result["detail"] = str(e)
+                remaining.append(entry)
+        else:
+            result["result"] = "retry_failed"
+            result["detail"] = yerr
+            logging.info(f"[export-ingest/pending] {provider}: attempt {entry['attempts']} failed — {yerr}")
+            # Drop after 3 overnight attempts (link is 24h-expiring; further
+            # retries past that are pointless) rather than growing forever.
+            if entry["attempts"] < 3:
+                remaining.append(entry)
+            else:
+                logging.warning(f"[export-ingest/pending] {provider}: giving up after 3 attempts (link likely expired)")
+
+        log_path = log_dir / f"export-ingest-pending-{iso_now}-{provider}.json"
+        with open(log_path, "w") as f:
+            json.dump(result, f, indent=2)
+
+    _save_pending_exports(config, remaining)
+
+
 def run_cycle(config, state, logger, dry_run=False):
     """Run one check cycle: fetch new emails + drafts, route, act."""
     results = []
+
+    # -1. Retry any provider-exports queued for the overnight window (no-op
+    #     outside the window — see run_pending_exports docstring).
+    run_pending_exports(config, logger, dry_run=dry_run)
 
     # 0. Fathom meeting-summary import — own poller, own state file, run
     #    first so it always sees mail before this cycle's inbox FETCH below

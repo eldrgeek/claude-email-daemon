@@ -64,6 +64,20 @@ provider_exports:
   max_download_gb: 6          # hard cap on any single export download
   chrome_cdp: http://localhost:9222   # logged-in Chrome for auth-gated links (Takeout)
   chrome_wait_seconds: 180    # how long to wait for a Chrome-initiated zip to land
+  # Yeshie-relay-driven download (2026-07-04 fix): Anthropic's export-ready
+  # link lands on an authenticated claude.ai PAGE, not a signed one-shot zip
+  # URL — a bare tab load never starts a download, it needs a UI click. The
+  # relay already drives claude.ai unattended every night (nightly_claude_export.sh
+  # Phase B), so route the actual download through it instead of a passive
+  # CDP-open-and-poll. Because this opens a visible tab in Mike's real Chrome,
+  # it's gated to the overnight window below — outside that window the export
+  # is queued (see export-pending-queue.json in state_dir) and picked up on
+  # the next in-window cycle instead of running against his daytime browser.
+  yeshie_relay: http://localhost:3333
+  yeshie_download_payload: ~/Projects/yeshie/sites/claude.ai/tasks/export-download.payload.json
+  yeshie_run_timeout_seconds: 60
+  overnight_window_start_hour: 3   # 03:00 local
+  overnight_window_end_hour: 4     # 04:00 local — matches nightly_claude_export.sh's 03:10 slot
 
 # --- Draft protocol ---
 # Drafts in Mike's Gmail with this subject prefix are treated as

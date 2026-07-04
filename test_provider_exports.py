@@ -214,5 +214,143 @@ finally:
     del os.environ["EXPORT_INGEST_EXTRA_ALLOWED_HOSTS"]
     httpd.shutdown()
 
+# ---------------------------------------------------------------------------
+# 2026-07-04 fix: reconstruct the 07-03 14:09 failure mode (WQ export-ingest
+# root cause) and prove the new needs_click_download / overnight-window /
+# Yeshie-driven path. No real Anthropic email or Chrome needed — the auth
+# wall is a local HTML page, and the Yeshie relay is mocked with a fake zip
+# drop instead of a live extension.
+print("== 2026-07-04 fix: click-required download + overnight gating ==")
+
+
+class AuthWallSrv(BaseHTTPRequestHandler):
+    """Serves an HTML page for the export link — reproduces the exact 07-03
+    failure: direct GET gets HTML (not a zip), same as an auth wall/app shell."""
+    def log_message(self, *a):
+        pass
+
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html")
+        self.end_headers()
+        self.wfile.write(b"<html><body>claude.ai app shell (not a zip)</body></html>")
+
+
+wall = HTTPServer(("127.0.0.1", 0), AuthWallSrv)
+wall_port = wall.server_address[1]
+threading.Thread(target=wall.serve_forever, daemon=True).start()
+os.environ["EXPORT_INGEST_EXTRA_ALLOWED_HOSTS"] = "127.0.0.1"
+wall_base = f"http://127.0.0.1:{wall_port}"
+
+tmp2 = tempfile.mkdtemp(prefix="export-ingest-test2-")
+downloads_dir = os.path.join(tmp2, "Downloads")
+export_dir = os.path.join(tmp2, "chat-exports")
+os.makedirs(downloads_dir, exist_ok=True)
+os.makedirs(export_dir, exist_ok=True)
+
+sent2 = []
+D.send_email = lambda c, to, subj, body, **k: sent2.append({"to": to, "subj": subj, "body": body})
+
+cfg2 = dict(cfg)
+cfg2["log_dir"] = tempfile.mkdtemp(prefix="export-ingest-test2-logs-")
+cfg2["state_file"] = os.path.join(tmp2, "state", "processed.json")
+cfg2["provider_exports"] = dict(cfg.get("provider_exports", {}))
+cfg2["provider_exports"]["overnight_window_start_hour"] = 3
+cfg2["provider_exports"]["overnight_window_end_hour"] = 4
+
+orig_provider2 = dict(D.PROVIDER_EXPORTS["claude"])
+D.PROVIDER_EXPORTS["claude"] = {**orig_provider2,
+                                 "allowed_hosts": ("127.0.0.1",),
+                                 "dest_dir": export_dir,
+                                 "needs_click_download": True}
+orig_downloads_dir = D.EXPORT_DOWNLOADS_DIR
+
+try:
+    D.EXPORT_DOWNLOADS_DIR = downloads_dir
+
+    em_claude_live = {"from": "Anthropic <noreply@anthropic.com>",
+                      "subject": "Your data is ready for download",
+                      "body_full": f"Download your data: <{wall_base}/export-link>"}
+
+    # --- Daytime arrival: direct fails (auth-wall HTML), should QUEUE, not
+    #     attempt Chrome/Yeshie against Mike's daytime browser. ---
+    os.environ.pop("EXPORT_INGEST_FORCE_WINDOW", None)
+    check("daytime: not in window by default",
+          not D._in_overnight_window(cfg2["provider_exports"]))
+    r = D.handle_provider_export_email(em_claude_live, cfg2, MagicMock())
+    check("daytime: queued not failed", r and r.get("result") == "queued_for_overnight", f"r={r}")
+    pending = D._load_pending_exports(cfg2)
+    check("daytime: one item queued", len(pending) == 1, f"pending={pending}")
+    check("daytime: queued url is the real link", pending and pending[0]["url"] == f"{wall_base}/export-link")
+    check("daytime: notified Mike about queueing",
+          sent2 and "queued" in sent2[-1]["subj"].lower())
+
+    # --- Same email again outside the window shouldn't touch Chrome; confirm
+    #     run_pending_exports() is a no-op outside the window (doesn't drop
+    #     the queue, doesn't call Yeshie). ---
+    sent2.clear()
+    D.run_pending_exports(cfg2, MagicMock(), dry_run=False)
+    check("pending retry no-op outside window", D._load_pending_exports(cfg2) == pending)
+
+    # --- Force the overnight window (test seam) and mock the Yeshie relay
+    #     call to simulate: relay reachable, chain runs, and the click
+    #     "lands" a zip in ~/Downloads (what a real click-through would do). ---
+    os.environ["EXPORT_INGEST_FORCE_WINDOW"] = "1"
+    check("forced: in window", D._in_overnight_window(cfg2["provider_exports"]))
+
+    def fake_yeshie_download(url, config, pe_cfg, dest_dir, prefix):
+        # Simulate the Yeshie chain having clicked "Download" and the browser
+        # finishing the file — write the zip directly to dest_dir, as
+        # _yeshie_download_export would locate it in ~/Downloads and the
+        # caller then shutil.move()s it. Returning a path in dest_dir here
+        # (not Downloads) still proves the caller's move+size+notify logic.
+        p = os.path.join(dest_dir, "simulated-yeshie-download.zip")
+        with open(p, "wb") as f:
+            f.write(ZIP_BYTES)
+        return p, None
+
+    orig_yeshie_fn = D._yeshie_download_export
+    D._yeshie_download_export = fake_yeshie_download
+    try:
+        r2 = D.handle_provider_export_email(em_claude_live, cfg2, MagicMock())
+        check("overnight: downloaded via yeshie", r2 and r2.get("result") == "downloaded", f"r2={r2}")
+        check("overnight: zip landed in dest_dir", r2 and os.path.exists(r2.get("zip_path", "")))
+        check("overnight: notified Mike of success",
+              sent2 and "downloaded" in sent2[-1]["subj"].lower())
+
+        # --- run_pending_exports(): drain the earlier-queued daytime entry
+        #     now that we're "overnight". ---
+        sent2.clear()
+        D.run_pending_exports(cfg2, MagicMock(), dry_run=False)
+        check("pending queue drained in window", D._load_pending_exports(cfg2) == [])
+        check("pending retry notified Mike",
+              sent2 and "downloaded" in sent2[-1]["subj"].lower() and "overnight" in sent2[-1]["subj"].lower())
+    finally:
+        D._yeshie_download_export = orig_yeshie_fn
+
+    # --- Yeshie itself fails (relay unreachable / no zip): daytime-queued
+    #     entry should retry up to 3x then drop, not grow forever. ---
+    D._queue_export_for_overnight(cfg2, "claude", f"{wall_base}/export-link", D.PROVIDER_EXPORTS["claude"], "test")
+    check("re-queued for drop test", len(D._load_pending_exports(cfg2)) == 1)
+
+    def failing_yeshie_download(url, config, pe_cfg, dest_dir, prefix):
+        return None, "simulated: relay unreachable"
+
+    D._yeshie_download_export = failing_yeshie_download
+    try:
+        for i in range(3):
+            D.run_pending_exports(cfg2, MagicMock(), dry_run=False)
+        check("gives up after 3 failed overnight attempts", D._load_pending_exports(cfg2) == [],
+              f"pending={D._load_pending_exports(cfg2)}")
+    finally:
+        D._yeshie_download_export = orig_yeshie_fn
+finally:
+    D.PROVIDER_EXPORTS["claude"] = orig_provider2
+    D.EXPORT_DOWNLOADS_DIR = orig_downloads_dir
+    D.send_email = orig_send
+    os.environ.pop("EXPORT_INGEST_FORCE_WINDOW", None)
+    os.environ.pop("EXPORT_INGEST_EXTRA_ALLOWED_HOSTS", None)
+    wall.shutdown()
+
 print(f"\n{PASS} passed, {FAIL} failed")
 sys.exit(1 if FAIL else 0)
