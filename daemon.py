@@ -458,6 +458,54 @@ BOARD_SUBJECT_RE = re.compile(r'^\[BOARD\]\s*(.*)', re.IGNORECASE)
 
 BOARD_INBOX_DIR = '~/Projects/SOMA/board/inbox'
 
+# Structured-meta lift (added 2026-07-04 for soma-feedback, SOMA-APP-STANDARD
+# §8): a producer that can't write real YAML frontmatter (e.g. a JS string
+# built inside a Netlify function, no yaml lib available) can instead embed
+# an HTML-comment block at the top of the email body:
+#
+#   <!--SOMA-CARD-META
+#   key: value
+#   key2: value2
+#   SOMA-CARD-META-->
+#
+# handle_board_email lifts every `key: value` line in that block into the
+# card's real frontmatter (in addition to the standard source-surface /
+# source-sender / received-at / needs-mike fields) and strips the block from
+# the visible body. This is how a public, unauthenticated widget endpoint
+# gets `auto-dispatch: true` / `app:` / `page:` etc. onto the actual card
+# without the daemon trusting arbitrary body content as code — it's a
+# plain key:value line parse, not YAML-eval, and only fires inside a block
+# with this exact marker.
+SOMA_CARD_META_RE = re.compile(
+    r'<!--SOMA-CARD-META\s*\n(.*?)\nSOMA-CARD-META-->\s*\n?', re.DOTALL
+)
+
+
+def _extract_card_meta(body):
+    """Returns (extra_frontmatter_dict, body_with_block_removed)."""
+    m = SOMA_CARD_META_RE.search(body)
+    if not m:
+        return {}, body
+    block = m.group(1)
+    extra = {}
+    for line in block.splitlines():
+        line = line.strip()
+        if not line or ':' not in line:
+            continue
+        key, _, val = line.partition(':')
+        key = key.strip()
+        val = val.strip()
+        # Only allow a small known-safe key set onto the card — a public
+        # endpoint must not be able to inject arbitrary frontmatter fields
+        # (e.g. spoofing source-surface/source-sender).
+        if key in (
+            'needs-mike', 'auto-dispatch', 'tags', 'app', 'page',
+            'reporter-name', 'reporter-email',
+        ):
+            extra[key] = val
+    cleaned_body = body[:m.start()] + body[m.end():]
+    return extra, cleaned_body
+
 # ---------------------------------------------------------------------------
 # Fathom meeting-summary short-circuit
 # ---------------------------------------------------------------------------
@@ -537,13 +585,22 @@ def handle_board_email(email_data, config, logger, trusted=False):
         suffix += 1
 
     body = email_data.get('body', '')
+    extra_meta, body = _extract_card_meta(body)
+    # extra_meta may override needs-mike (e.g. soma-feedback sets it per
+    # submitBuild); everything else is appended after the standard fields.
+    needs_mike = extra_meta.pop('needs-mike', 'false')
+    frontmatter_lines = [
+        "source-surface: email",
+        f"source-sender: {sender_email}",
+        f"received-at: {now.isoformat()}",
+        f"needs-mike: {needs_mike}",
+    ]
+    for k, v in extra_meta.items():
+        frontmatter_lines.append(f"{k}: {v}")
     card = (
         "---\n"
-        f"source-surface: email\n"
-        f"source-sender: {sender_email}\n"
-        f"received-at: {now.isoformat()}\n"
-        f"needs-mike: false\n"
-        "---\n\n"
+        + "\n".join(frontmatter_lines)
+        + "\n---\n\n"
         f"# {title_raw}\n\n"
         f"{body}\n"
     )
