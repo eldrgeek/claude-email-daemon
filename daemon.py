@@ -456,6 +456,38 @@ def handle_dispatch_email(email_data, config, logger):
 
 BOARD_SUBJECT_RE = re.compile(r'^\[BOARD\]\s*(.*)', re.IGNORECASE)
 
+# Self-generated confirmation replies (WQ-123/WQ-128 bug): handle_board_email
+# sends "Re: [BOARD] <title>" back to the submitting sender. When that sender
+# IS claude@mike-wolf.com (soma-feedback's self-send-to-itself pattern —
+# SOMA-APP-STANDARD.md §8), the confirmation lands back in the SAME inbox
+# this loop just polled, doesn't match BOARD_SUBJECT_RE (its anchor requires
+# the subject to *start* with "[BOARD]", and "Re: " breaks that), and falls
+# through to the general LLM classifier — which the routing prompt's own
+# "always forward mail from @mike-wolf.com" policy override then flags as
+# forward_urgent. Observed firing twice in one evening (2026-07-04) per the
+# Playmaker feedback-pipeline dogfood session. Recognize and skip it here,
+# BEFORE the general BOARD_SUBJECT_RE check, so it never reaches routing.
+BOARD_SELF_REPLY_RE = re.compile(r'^(?:re:\s*)+\[board\]', re.IGNORECASE)
+
+
+def _is_board_self_reply(email_data, config):
+    """True if this looks like the daemon's own 'Re: [BOARD] ...' confirmation
+    bouncing back into claude@'s inbox from a self-send (soma-feedback and any
+    future self-emailing board producer). Matched on subject shape + sender
+    identity, not just subject, so a legitimate human "Re: [BOARD] ..." reply
+    (e.g. Mike replying to a card confirmation with a follow-up) is NOT
+    swallowed — only mail whose sender is the daemon's own claude@ address
+    gets treated as noise here."""
+    subject = email_data.get('subject', '')
+    if not BOARD_SELF_REPLY_RE.match(subject):
+        return False
+    sender_raw = email_data.get('from', '')
+    m_addr = re.search(r'<([^>]+)>', sender_raw)
+    sender_email = (m_addr.group(1).strip().lower() if m_addr else sender_raw.strip().lower())
+    claude_address = config.get('claude_email', {}).get('address', '').strip().lower()
+    return bool(claude_address) and sender_email == claude_address
+
+
 BOARD_INBOX_DIR = '~/Projects/SOMA/board/inbox'
 
 # Structured-meta lift (added 2026-07-04 for soma-feedback, SOMA-APP-STANDARD
@@ -500,7 +532,7 @@ def _extract_card_meta(body):
         # (e.g. spoofing source-surface/source-sender).
         if key in (
             'needs-mike', 'auto-dispatch', 'tags', 'app', 'page',
-            'reporter-name', 'reporter-email',
+            'reporter-name', 'reporter-email', 'area',
         ):
             extra[key] = val
     cleaned_body = body[:m.start()] + body[m.end():]
@@ -3468,6 +3500,17 @@ def run_cycle(config, state, logger, dry_run=False):
             if FATHOM_SENDER_RE.search(em.get('from', '')):
                 logging.info(f"  [fathom/skip-routing] {em['subject'][:60]}")
                 results.append({"action": "fathom_skip_routing", "subject": em["subject"]})
+                state.mark_processed("inbox", em["stable_id"])
+                continue
+
+            # Self-generated "Re: [BOARD] ..." confirmation bouncing back into
+            # claude@'s own inbox (soma-feedback's self-send pattern) — skip
+            # before it can fall through to general routing and get flagged
+            # forward_urgent by the @mike-wolf.com policy override. See
+            # BOARD_SELF_REPLY_RE / _is_board_self_reply above (WQ-128 fix).
+            if _is_board_self_reply(em, config):
+                logging.info(f"  [board/self-reply-skip] {em['subject'][:60]}")
+                results.append({"action": "board_self_reply_skip", "subject": em["subject"]})
                 state.mark_processed("inbox", em["stable_id"])
                 continue
 
