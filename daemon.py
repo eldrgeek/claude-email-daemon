@@ -659,6 +659,142 @@ def handle_board_email(email_data, config, logger, trusted=False):
 
 
 # ---------------------------------------------------------------------------
+# Briefing intake — [BRIEFING] <persona> subject pattern (2026-07-09)
+# ---------------------------------------------------------------------------
+# Carries an interview briefing from an emailed doc to a soma-zoom-presence
+# interviewer persona (Izzy). The guest (Eric) has his own ChatGPT write a
+# briefing naming the subject he wants covered, emails it to claude@mike-wolf.com
+# with subject `[BRIEFING] izzy` (briefing as the body OR a .md/.txt attachment),
+# and this handler POSTs the text to the relay's token-gated POST /briefing/<persona>
+# endpoint. The relay writes state/<persona>-briefing.md, which Izzy's brain reads
+# on every turn — so the whole interview is grounded in that briefing, zero
+# copy-paste. Short-circuits LLM routing exactly like dispatch/board.
+#
+# Chosen over a Google-Drive-folder poller because this Mac has NO clean Drive
+# access (no rclone remote, no gdrive CLI, no mounted Drive) — the email daemon
+# is already installed, already handles attachments + a subject-routing convention,
+# and dedupes by message-id (so the same email is never POSTed twice). See
+# ~/Projects/soma-zoom-presence/docs/BRIEFING-INTAKE.md.
+
+BRIEFING_SUBJECT_RE = re.compile(r'^\[BRIEFING\]\s*(.*)', re.IGNORECASE)
+
+
+def handle_briefing_email(email_data, config, logger):
+    """Handle [BRIEFING] <persona> emails: POST the briefing text to the relay.
+    Returns a briefing log dict, or None if subject doesn't match / disabled."""
+    br_cfg = config.get('briefing', {})
+    if not br_cfg.get('enabled', False):
+        return None
+    subject = email_data.get('subject', '')
+    m = BRIEFING_SUBJECT_RE.match(subject)
+    if not m:
+        return None
+
+    _load_env()  # ensure the daemon's gitignored .env (BRIEFING_TOKEN) is loaded
+
+    rest = (m.group(1) or '').strip()
+    persona = rest.split()[0].lower() if rest else 'izzy'
+    persona = re.sub(r'[^a-z0-9_-]', '', persona) or 'izzy'
+
+    sender_raw = email_data.get('from', '')
+    m_addr = re.search(r'<([^>]+)>', sender_raw)
+    sender_email = m_addr.group(1).strip().lower() if m_addr else sender_raw.strip().lower()
+
+    # Own allowlist (falls back to dispatch.allowed_senders). Eric is the intended
+    # sender — his address must be added here (or to dispatch.allowed_senders).
+    allowed = [s.lower() for s in (
+        br_cfg.get('allowed_senders')
+        or config.get('dispatch', {}).get('allowed_senders', [])
+    )]
+
+    briefing_log = {
+        'type': 'briefing',
+        'from': sender_raw,
+        'sender_email': sender_email,
+        'subject': subject,
+        'persona': persona,
+        'timestamp': datetime.now().isoformat(),
+    }
+
+    def _reply(body):
+        try:
+            send_email(config, sender_raw, f'Re: {subject}', body,
+                       in_reply_to=email_data.get('message_id'),
+                       references=email_data.get('references'),
+                       cc=br_cfg.get('cc'))
+        except Exception as e:
+            logging.error(f"Failed to send briefing reply: {e}")
+
+    if sender_email not in allowed:
+        briefing_log['result'] = 'rejected:sender_not_allowlisted'
+        logging.warning(f"Briefing rejected (sender_not_allowlisted): {sender_email}")
+        _reply('Briefing refused: sender not on allowlist.')
+        return briefing_log
+
+    # Prefer a .md/.txt attachment's extracted text; else the full email body.
+    briefing_text = ''
+    for a in email_data.get('attachments', []) or []:
+        name = (a.get('filename') or '').lower()
+        if name.endswith(('.md', '.markdown', '.txt')) and (a.get('text') or '').strip():
+            briefing_text = a['text'].strip()
+            briefing_log['source'] = f"attachment:{a.get('filename')}"
+            break
+    if not briefing_text:
+        briefing_text = (email_data.get('body_full') or email_data.get('body') or '').strip()
+        briefing_log['source'] = 'body'
+
+    if not briefing_text:
+        briefing_log['result'] = 'rejected:empty'
+        _reply('Briefing refused: no briefing text found in the body or a .md/.txt attachment.')
+        return briefing_log
+
+    relay_url = br_cfg.get('relay_url', 'https://vpsmikewolf.duckdns.org/zoom-presence').rstrip('/')
+    token = br_cfg.get('token') or os.environ.get('BRIEFING_TOKEN')
+    if not token:
+        briefing_log['result'] = 'error:no_token'
+        logging.error("Briefing intake: no token (set briefing.token in config.yaml or BRIEFING_TOKEN in the daemon's .env)")
+        _reply('Briefing failed: the relay briefing token is not configured on this machine. '
+               'Mike must set briefing.token (or BRIEFING_TOKEN in the daemon .env).')
+        return briefing_log
+
+    try:
+        resp = requests.post(
+            f"{relay_url}/briefing/{persona}",
+            data=briefing_text.encode('utf-8'),
+            headers={'Authorization': f'Bearer {token}', 'Content-Type': 'text/markdown'},
+            timeout=30,
+        )
+        briefing_log['relay_status'] = resp.status_code
+        if resp.status_code == 200:
+            info = {}
+            try:
+                info = resp.json()
+            except Exception:
+                pass
+            briefing_log['result'] = 'delivered'
+            briefing_log['chars'] = info.get('chars', len(briefing_text))
+            logging.info(f"[briefing] delivered to {relay_url}/briefing/{persona} ({briefing_log['chars']} chars)")
+            _reply(f"Briefing delivered.\n\n"
+                   f"Persona: {persona}\n"
+                   f"Relay: {relay_url}/briefing/{persona}\n"
+                   f"Length: {briefing_log['chars']} chars\n"
+                   f"Source: {briefing_log.get('source')}\n\n"
+                   f"{persona.capitalize()} is now briefed for the interview. "
+                   f"You can confirm on the operator console (briefed ✓).")
+        else:
+            briefing_log['result'] = f'error:relay_{resp.status_code}'
+            logging.error(f"[briefing] relay returned {resp.status_code}: {resp.text[:200]}")
+            _reply(f"Briefing failed: the relay returned HTTP {resp.status_code}. "
+                   f"({'unauthorized — token mismatch' if resp.status_code == 401 else resp.text[:160]})")
+    except requests.RequestException as e:
+        briefing_log['result'] = f'error:{e}'
+        logging.error(f"[briefing] POST to relay failed: {e}")
+        _reply(f"Briefing failed: could not reach the relay at {relay_url}. ({e})")
+
+    return briefing_log
+
+
+# ---------------------------------------------------------------------------
 # Provider data-export ingestion — zero-touch email→zip (2026-07-03)
 # ---------------------------------------------------------------------------
 # All three chat providers (Anthropic claude.ai, OpenAI ChatGPT, Google
@@ -2363,6 +2499,17 @@ def handle_trusted_email(email_data, config, logger):
         - No cost cap; no escalation path (owner is self)
         - Hard stops (destructive, access_control) are SURFACED to the owner as a
           manual-action notice — never auto-executed regardless of tier
+      data_requester (e.g. Mark Kinski)
+        - For trusted people who email INFORMATION / ANALYSIS requests, not site builds.
+        - Auto-dispatch: off_site_research and every other non-hard-stop, non-ambiguous
+          category under cost_threshold_usd. Unlike member_services, off_site_research is
+          NOT escalated — that's the whole point of the tier.
+        - Runs in DATA MODE: _dispatch_one builds an analysis prompt with NO repo /
+          deploy / changelog. The worker writes a `## Result` section that the standard
+          completion path emails back to the requester (CC escalate_to).
+        - Clarify with requester: ambiguous (asked rather than guessed) — same as others.
+        - Hard stops (destructive, access_control) still ESCALATE to escalate_to and are
+          never executed — this is what keeps credentials/keys/secrets off-limits.
 
     HARD STOPS reflect IRREVERSIBILITY, not the presence of words like "delete":
     irreversible data loss (dropping a database, deleting all records/backups) and
@@ -2647,6 +2794,25 @@ def handle_trusted_email(email_data, config, logger):
                     if raddr not in [e.lower() for e in extra_cc]:
                         extra_cc.append(raddr)
 
+    elif tier == "data_requester":
+        # data_requester tier — trusted INFORMATION / ANALYSIS requesters (e.g. Mark).
+        # Hard stops + ambiguous were already handled above (secrets/keys still escalate).
+        # Unlike member_services, off_site_research is NOT escalated here: analysis/data
+        # requests are exactly what this tier auto-serves. Respect auto_dispatch + cost cap.
+        auto_dispatch = requester.get("auto_dispatch", False)
+        if not auto_dispatch:
+            return _escalate(
+                "auto_dispatch is disabled — routing for manual approval", classification
+            )
+
+        cost_threshold = requester.get("cost_threshold_usd")
+        if cost_threshold is not None and cost_usd is not None and cost_usd > cost_threshold:
+            return _escalate(
+                f"Cost ${cost_usd} exceeds threshold ${cost_threshold}", classification
+            )
+
+        extra_cc = list(requester.get("cc_dispatch_to", []))
+
     else:
         # member_services tier
         # (ambiguous is handled above via _request_clarification, for all tiers)
@@ -2683,8 +2849,40 @@ def handle_trusted_email(email_data, config, logger):
         disp_iso = datetime.now().strftime('%Y%m%dT%H%M%S')
         audit_path = f"~/Projects/SOMA/audits/{disp_iso}-{task_name}.md"
 
-        prompt = (
-            "## Context\n"
+        if tier == "data_requester":
+            # DATA MODE: an information / analysis request. No repo, no deploy, no
+            # changelog. The worker answers the question / analyzes the material and
+            # writes a `## Result` section, which the completion path emails back to
+            # the requester (CC escalate_to) verbatim.
+            prompt = (
+                "## Context\n"
+                f"Email from {req_name} ({sender_email}).\n"
+                f"Subject: {email_data.get('subject', '')}\n\n"
+                f"## Email Body\n{email_data.get('body', '')}\n\n"
+                f"{_format_attachments_section(email_data.get('attachments'))}"
+                f"{task_instructions}"
+                "## What to produce\n"
+                "This is an INFORMATION / ANALYSIS request, not a website or code change. "
+                "There is no site to build and no repo to touch. Do NOT modify, commit, "
+                "push, or deploy anything. Analyze the material the sender provided and/or "
+                "answer their question directly and substantively.\n\n"
+                "## Sharing policy (important)\n"
+                "Answer at a COLLABORATOR level — share what you'd tell a trusted friend "
+                "working alongside Mike: helpful, concrete, straight. But do NOT expose raw "
+                "internal SOMA state, credentials, API keys, secrets, other people's private "
+                "data, or anything access-controlled. When you are unsure whether something "
+                "is shareable, summarize it at a high level rather than leaking specifics. "
+                "If the request can only be answered by revealing protected material, say so "
+                "plainly instead.\n\n"
+                "## Done criteria\n"
+                f"Write your work to {audit_path}. Put the reply you want the sender to "
+                "receive under a `## Result` heading — that section is emailed to them "
+                "verbatim, so address it to the sender in plain language. Do NOT push to any "
+                "repo or deploy anything."
+            )
+        else:
+            prompt = (
+             "## Context\n"
             f"Email from {req_name} ({sender_email}).\n"
             f"Subject: {email_data.get('subject', '')}\n\n"
             f"## Email Body\n{email_data.get('body', '')}\n\n"
@@ -3549,6 +3747,19 @@ def run_cycle(config, state, logger, dry_run=False):
                 else:
                     logging.info(f"  [board/dry-run] {em['subject'][:60]}")
                     results.append({"action": "board_dry_run", "subject": em["subject"]})
+                state.mark_processed("inbox", em["stable_id"])
+                continue
+
+            # Briefing emails ([BRIEFING] <persona>) short-circuit LLM routing —
+            # POST the briefing to the soma-zoom-presence relay, confirm, done.
+            if BRIEFING_SUBJECT_RE.match(em.get('subject', '')):
+                if not dry_run:
+                    briefing_result = handle_briefing_email(em, config, logger)
+                    results.append(briefing_result or {})
+                    logging.info(f"  [briefing] {em['subject'][:60]}")
+                else:
+                    logging.info(f"  [briefing/dry-run] {em['subject'][:60]}")
+                    results.append({"action": "briefing_dry_run", "subject": em["subject"]})
                 state.mark_processed("inbox", em["stable_id"])
                 continue
 

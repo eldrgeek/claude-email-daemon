@@ -130,6 +130,34 @@ dispatch:
     Hermes:
       enabled: false  # not yet installed on VPS
 
+# --- Briefing intake (soma-zoom-presence interviewer personas) ---
+# Emails with subject [BRIEFING] <persona> carry an interview briefing to the
+# soma-zoom-presence relay's POST /briefing/<persona> endpoint (default persona:
+# izzy). The briefing text is taken from a .md/.txt attachment if present, else
+# the email body, and POSTed with the shared bearer token below. The relay writes
+# state/<persona>-briefing.md, which the persona's brain reads on every turn.
+# See ~/Projects/soma-zoom-presence/docs/BRIEFING-INTAKE.md.
+briefing:
+  enabled: true
+  # The relay's public base URL (VPS production). For local relay testing point
+  # this at http://localhost:8787 (or the self-test port).
+  relay_url: https://vpsmikewolf.duckdns.org/zoom-presence
+  # Shared token — MUST equal BRIEFING_TOKEN in the relay's .env. Prefer setting
+  # it as BRIEFING_TOKEN in this daemon's own gitignored .env (auto-loaded) over
+  # committing it here. If unset in both, briefing intake fails with a clear reply.
+  # token: <set in the daemon .env as BRIEFING_TOKEN instead>
+  # Who may send a briefing. Falls back to dispatch.allowed_senders when unset.
+  # Eric's real address must be here (or in dispatch.allowed_senders) for his
+  # briefing to be accepted.
+  allowed_senders:
+    - mw@mike-wolf.com
+    - mike@embeddedsystemsresearch.org
+    - claude@mike-wolf.com
+    # - eric@ekcosystem.com   # FILL IN Eric's real address, then uncomment
+  # CC these addresses on every briefing confirmation/failure reply.
+  cc:
+    - mw@mike-wolf.com
+
 # --- Trusted requester pipeline ---
 # Per-sender dispatch tiers. Each entry configures how emails from that address are handled.
 #
@@ -138,6 +166,14 @@ dispatch:
 #                      escalate destructive / access_control / off_site / high_cost to escalate_to
 #   owner            – auto-dispatch everything not caught by hard stops; no cost cap;
 #                      hard stops (destructive, access_control) are surfaced as manual-action notices
+#   data_requester   – trusted people who email INFORMATION / ANALYSIS requests (not site builds).
+#                      Auto-dispatch off_site_research and other non-hard-stop, non-ambiguous
+#                      categories (does NOT hit the member_services off_site_research escalation),
+#                      under cost_threshold_usd. The worker runs in DATA MODE: it analyzes the
+#                      material / answers the question and writes a `## Result` section that is
+#                      emailed back to the requester (CC escalate_to) — NO repo, deploy, or
+#                      changelog. Hard stops still escalate (access_control keeps secrets/keys
+#                      off-limits regardless of sender); ambiguous still asks the requester.
 #
 # HARD STOPS (all tiers): destructive, access_control — NEVER auto-executed.
 # "destructive" means IRREVERSIBLE / high-blast-radius (dropping a database,
@@ -179,6 +215,24 @@ trusted_requesters:
     site_label: "the Witness Projection / Izzy site"
     site_description: "Izzy is the AI dramaturge and life coach collaborator for Eric's play Witness Projection — an AI chat interface with RAG knowledge retrieval, TTS voice, working document, and session history."
     repo: "~/Projects/SOMA/services/izzy-chat"
+
+  # Mark Kinski (Discord @Inarai) — first data_requester. Emails information /
+  # analysis requests; results are auto-served back by email (CC Mike). A request
+  # for keys/passwords/access classifies access_control and hard-stops regardless.
+  mark@inarai.com:
+    name: Mark
+    tier: data_requester
+    auto_dispatch: true
+    cc_dispatch_to:
+      - mw@mike-wolf.com
+    # Cost cap: 100 (same as Greg/Eric, conservative). A request that classifies as
+    # proposal_with_cost above $100 escalates to Mike instead of auto-running; ordinary
+    # data/analysis requests carry no dollar amount and pass straight through.
+    cost_threshold_usd: 100
+    completion_timeout_hours: 4
+    escalate_to: mw@mike-wolf.com
+    ack_greeting: "Hi Mark,"
+    ack_signature: "Claude\n(assistant for Mike Wolf)"
 
   mw@mike-wolf.com:
     name: Mike Wolf
