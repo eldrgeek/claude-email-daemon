@@ -153,7 +153,7 @@ briefing:
     - mw@mike-wolf.com
     - mike@embeddedsystemsresearch.org
     - claude@mike-wolf.com
-    # - eric@ekcosystem.com   # FILL IN Eric's real address, then uncomment
+    - eric@ekcosystem.com   # CONFIRMED 2026-07-09 — Eric briefs Izzy by email
   # CC these addresses on every briefing confirmation/failure reply.
   cc:
     - mw@mike-wolf.com
@@ -200,7 +200,7 @@ trusted_requesters:
     site_description: "A membership site for the Legends of Basketball committee — member directory, event minutes, resources, and member services tools."
     repo: "~/Projects/legends-membership-site"
 
-  # FILL IN: replace eric@ekcosystem.com with Eric's real email address (one-line edit)
+  # Eric Kohner — Playmaker/Witness Projection collaborator. Address CONFIRMED 2026-07-09.
   eric@ekcosystem.com:
     name: Eric
     tier: member_services
