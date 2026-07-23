@@ -3,3 +3,8 @@ __pycache__/
 logs/
 state/
 .env
+
+# Key-rotation backups (2026-07-15 sweep left these estate-wide). They hold
+# service_role / provider keys verbatim — never track them.
+.env.bak*
+.env.backup*
