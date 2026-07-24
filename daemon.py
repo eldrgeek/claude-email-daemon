@@ -795,6 +795,141 @@ def handle_briefing_email(email_data, config, logger):
 
 
 # ---------------------------------------------------------------------------
+# Back-office negotiation intake — [BACKOFFICE] subject pattern (2026-07-16)
+# ---------------------------------------------------------------------------
+# AI-to-AI negotiation channel (first use: MOU IP section, Izzy ↔ SOMA AI).
+# An allowed counterparty AI emails a negotiation round to claude@mike-wolf.com
+# with a subject containing [BACKOFFICE]; this handler files the round under
+# backoffice.folder/rounds/ and spawns a cc-dispatch worker that responds per
+# backoffice.folder/PROTOCOL.md. Humans (CC'd on every message) decide; the AIs
+# only draft. Short-circuits LLM routing like dispatch/board/briefing.
+#
+# Loop safety: unlike [BOARD], replies MUST route (rounds thread as "Re: ..."),
+# so the regex tolerates Re:/Fwd: prefixes. The loop is broken at the allowlist
+# instead: claude@mike-wolf.com (the address the worker sends FROM) is never an
+# allowed sender, so the daemon can't dispatch on its own outbound thread.
+
+BACKOFFICE_SUBJECT_RE = re.compile(
+    r'^(?:(?:re|fwd?):\s*)*\[BACKOFFICE\]\s*(.*)', re.IGNORECASE)
+
+
+def handle_backoffice_email(email_data, config, logger):
+    """Handle [BACKOFFICE] emails: file the round, dispatch a negotiation worker.
+    Returns a log dict, or None if subject doesn't match / disabled."""
+    bo_cfg = config.get('backoffice', {})
+    if not bo_cfg.get('enabled', False):
+        return None
+    subject = email_data.get('subject', '')
+    m = BACKOFFICE_SUBJECT_RE.match(subject)
+    if not m:
+        return None
+
+    topic = (m.group(1) or '').strip() or 'untitled'
+    sender_raw = email_data.get('from', '')
+    m_addr = re.search(r'<([^>]+)>', sender_raw)
+    sender_email = m_addr.group(1).strip().lower() if m_addr else sender_raw.strip().lower()
+
+    bo_log = {
+        'type': 'backoffice',
+        'from': sender_raw,
+        'sender_email': sender_email,
+        'subject': subject,
+        'timestamp': datetime.now().isoformat(),
+    }
+
+    def _reply(body, subj_prefix='Backoffice'):
+        # Confirmation subjects never start with [BACKOFFICE], so they can
+        # never re-match this handler even if they loop back into the inbox.
+        try:
+            send_email(config, sender_raw, f'{subj_prefix}: {topic[:80]}', body,
+                       in_reply_to=email_data.get('message_id'),
+                       references=email_data.get('references'),
+                       cc=bo_cfg.get('cc'))
+        except Exception as e:
+            logging.error(f"Failed to send backoffice reply: {e}")
+
+    allowed = [s.lower() for s in bo_cfg.get('allowed_senders', [])]
+    if 'claude@mike-wolf.com' in allowed:
+        # Hard guard against a config edit reintroducing the self-dispatch loop.
+        allowed.remove('claude@mike-wolf.com')
+        logging.warning("[backoffice] claude@mike-wolf.com stripped from allowed_senders (loop guard)")
+    if sender_email not in allowed:
+        bo_log['result'] = 'rejected:sender_not_allowlisted'
+        logging.warning(f"[backoffice] rejected (sender_not_allowlisted): {sender_email}")
+        return bo_log  # silent drop: don't ack strangers on this channel
+
+    state_dir = os.path.expanduser(config.get('daemon', {}).get('state_dir', '~/.claude-email-daemon'))
+    rate_limit = bo_cfg.get('rate_limit_per_hour', 5)
+    if not _check_rate_limit(state_dir, f'backoffice:{sender_email}', rate_limit):
+        bo_log['result'] = 'rate_limit_exceeded'
+        _reply(f'Round refused: rate limit exceeded ({rate_limit}/hour). Resend later.')
+        return bo_log
+
+    # Round text: prefer a .md/.txt attachment, else the body.
+    round_text = ''
+    for a in email_data.get('attachments', []) or []:
+        name = (a.get('filename') or '').lower()
+        if name.endswith(('.md', '.markdown', '.txt')) and (a.get('text') or '').strip():
+            round_text = a['text'].strip()
+            bo_log['source'] = f"attachment:{a.get('filename')}"
+            break
+    if not round_text:
+        round_text = (email_data.get('body_full') or email_data.get('body') or '').strip()
+        bo_log['source'] = 'body'
+    if not round_text:
+        bo_log['result'] = 'rejected:empty'
+        _reply('Round refused: no text found in the body or a .md/.txt attachment.')
+        return bo_log
+
+    folder = os.path.expanduser(bo_cfg.get('folder', '~/Projects/SOMA/eric/backoffice'))
+    rounds_dir = os.path.join(folder, 'rounds')
+    os.makedirs(rounds_dir, exist_ok=True)
+    iso_now = datetime.now().strftime('%Y%m%dT%H%M%S')
+    slug = re.sub(r'[^a-z0-9]+', '-', topic.lower()).strip('-')[:48] or 'round'
+    round_path = os.path.join(rounds_dir, f'{iso_now}-in-{slug}.md')
+    with open(round_path, 'w') as f:
+        f.write(f"---\nfrom: {sender_raw}\nsubject: {subject}\n"
+                f"message_id: {email_data.get('message_id', '')}\n"
+                f"received: {datetime.now().isoformat()}\n---\n\n{round_text}\n")
+    bo_log['round_path'] = round_path
+
+    is_test = bool(re.search(r'\bTEST\b', topic))
+    protocol_path = os.path.join(folder, 'PROTOCOL.md')
+    task_name = f'backoffice-{slug}'[:60]
+    prompt = (
+        f"A [BACKOFFICE] negotiation round arrived from {sender_email}.\n"
+        f"Incoming round file: {round_path}\n"
+        f"Original subject: {subject}\n\n"
+        f"Follow the SOMA-side worker instructions in {protocol_path} exactly. "
+        f"Read that protocol first, then all prior rounds in {rounds_dir}, then respond. "
+        f"Reply threading: In-Reply-To message id is in the round file's frontmatter.\n"
+        + ("\nThis round's topic contains TEST: per protocol, file your reply in "
+           "rounds/ only — send NO email.\n" if is_test else "")
+    )
+    mac_cmd = os.path.expanduser('~/.local/bin/cc-dispatch')
+    if not os.path.exists(mac_cmd):
+        bo_log['result'] = 'error:cc-dispatch_not_found'
+        logging.error(f"[backoffice] cc-dispatch not found at {mac_cmd}")
+        _reply(f'Round filed at {round_path}, but the negotiation worker could not be '
+               f'dispatched (cc-dispatch missing). Mike has been CC\'d.')
+        return bo_log
+    model = bo_cfg.get('model', 'anthropic/claude-sonnet-4-5')
+    proc = subprocess.Popen(
+        [mac_cmd, '--model', model, '--workdir', folder, task_name, prompt],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    )
+    bo_log['dispatch_pid'] = proc.pid
+    bo_log['result'] = 'dispatched'
+    logging.info(f"[backoffice] round filed ({round_path}); worker pid={proc.pid}")
+    _reply(f"Round received and filed.\n\n"
+           f"Topic: {topic}\n"
+           f"A SOMA AI is drafting the response per the back-office protocol; "
+           f"it will reply on the [BACKOFFICE] thread (both principals CC'd).\n"
+           f"Round file: {round_path}")
+    return bo_log
+
+
+# ---------------------------------------------------------------------------
 # Provider data-export ingestion — zero-touch email→zip (2026-07-03)
 # ---------------------------------------------------------------------------
 # All three chat providers (Anthropic claude.ai, OpenAI ChatGPT, Google
@@ -3760,6 +3895,19 @@ def run_cycle(config, state, logger, dry_run=False):
                 else:
                     logging.info(f"  [briefing/dry-run] {em['subject'][:60]}")
                     results.append({"action": "briefing_dry_run", "subject": em["subject"]})
+                state.mark_processed("inbox", em["stable_id"])
+                continue
+
+            # Back-office negotiation rounds ([BACKOFFICE], Re:-tolerant) short-circuit
+            # LLM routing — file the round, dispatch the negotiation worker, confirm.
+            if BACKOFFICE_SUBJECT_RE.match(em.get('subject', '')):
+                if not dry_run:
+                    bo_result = handle_backoffice_email(em, config, logger)
+                    results.append(bo_result or {})
+                    logging.info(f"  [backoffice] {em['subject'][:60]}")
+                else:
+                    logging.info(f"  [backoffice/dry-run] {em['subject'][:60]}")
+                    results.append({"action": "backoffice_dry_run", "subject": em["subject"]})
                 state.mark_processed("inbox", em["stable_id"])
                 continue
 

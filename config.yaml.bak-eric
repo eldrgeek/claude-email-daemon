@@ -1,0 +1,130 @@
+# Claude Email Daemon Configuration
+
+# --- Polling ---
+poll_interval_seconds: 300  # 5 minutes
+
+# --- Claude's email (IMAP/SMTP) ---
+claude_email:
+  address: claude@mike-wolf.com
+  imap_server: imap.gmail.com
+  smtp_server: smtp.gmail.com
+  smtp_port: 587
+  # App password read from ~/Projects/memory/context/email.md
+  # Or set CLAUDE_EMAIL_PW environment variable
+
+# --- Mike's AI email (IMAP for draft checking) ---
+# This is a dedicated account for Claude Web/Mobile to leave draft instructions
+mike_email:
+  address: mikeai@mike-wolf.com
+  imap_server: imap.gmail.com
+  # App password read from ~/Projects/memory/context/email.md
+  # Or set MIKE_EMAIL_PW environment variable
+
+# --- LLM ---
+llm:
+  endpoint: http://localhost:11434/api/generate
+  model: qwen2.5:7b
+  temperature: 0.1
+  max_tokens: 200
+
+# --- Draft protocol ---
+# Drafts in Mike's Gmail with this subject prefix are treated as
+# instructions from Claude Web/Mobile
+draft_prefix: "[CLAUDE]"
+
+# --- Forwarding ---
+forward_to: mw@mike-wolf.com
+
+# --- Logging ---
+log_dir: ~/Projects/claude-email-daemon/logs
+state_file: ~/Projects/claude-email-daemon/state/processed.json
+
+# --- Action policies ---
+# Override LLM decisions for specific senders/patterns
+policies:
+  always_forward:
+    - "@mike-wolf.com"
+  always_ignore:
+    - "noreply@marketing"
+    - "no-reply@notifications"
+
+# --- Dispatch routing ---
+# Emails with subject [DISPATCH:Mac|VPS|Hermes] are routed directly to execution
+# backends, bypassing the LLM router entirely.
+dispatch:
+  enabled: true
+  allowed_senders:
+    - mw@mike-wolf.com
+    - mike@embeddedsystemsresearch.org
+    - claude@mike-wolf.com
+  rate_limit_per_hour: 5
+  body_max_bytes: 51200
+  platforms:
+    Mac:
+      command: ~/.local/bin/cc-dispatch
+    VPS:
+      ssh_target: dev@vpsmikewolf.duckdns.org
+      command: ~/.local/bin/cc-dispatch
+      # Pin the VPS host key here as a known_hosts entry or key-only value,
+      # or pre-populate ~/.ssh/known_hosts for ssh_target.
+      # host_key: vpsmikewolf.duckdns.org ssh-ed25519 AAAA...
+    Hermes:
+      enabled: false  # not yet installed on VPS
+
+# --- Trusted requester pipeline ---
+# Per-sender dispatch tiers. Each entry configures how emails from that address are handled.
+#
+# Tiers:
+#   member_services  – auto-dispatch on-site builds under cost_threshold_usd;
+#                      escalate destructive / access_control / off_site / high_cost to escalate_to
+#   owner            – auto-dispatch everything not caught by hard stops; no cost cap;
+#                      hard stops (destructive, access_control) are surfaced as manual-action notices
+#
+# HARD STOPS (all tiers): destructive, access_control — NEVER auto-executed.
+#
+trusted_requesters:
+  gfos44@gmail.com:
+    name: Greg Foster
+    tier: member_services
+    auto_dispatch: true
+    # CC Mike on every ack and completion email for transparency
+    cc_dispatch_to:
+      - mw@mike-wolf.com
+    # Requests mentioning costs above this threshold go to escalate_to
+    cost_threshold_usd: 100
+    completion_timeout_hours: 4
+    escalate_to: mw@mike-wolf.com
+    ack_greeting: "Hi Greg,"
+    ack_signature: "Claude\n(AI assistant for the Legends website)"
+    site_label: "the Legends website"
+    site_description: "A membership site for the Legends of Basketball committee — member directory, event minutes, resources, and member services tools."
+    repo: "~/Projects/legends-membership-site"
+
+  # FILL IN: replace __ERIC_EMAIL__ with Eric's real email address (one-line edit)
+  __ERIC_EMAIL__:
+    name: Eric
+    tier: member_services
+    auto_dispatch: true
+    cc_dispatch_to:
+      - mw@mike-wolf.com
+    cost_threshold_usd: 100
+    completion_timeout_hours: 4
+    escalate_to: mw@mike-wolf.com
+    ack_greeting: "Hi Eric,"
+    ack_signature: "Claude\n(AI assistant for Witness Projection)"
+    site_label: "the Witness Projection / Izzy site"
+    site_description: "Izzy is the AI dramaturge and life coach collaborator for Eric's play Witness Projection — an AI chat interface with RAG knowledge retrieval, TTS voice, working document, and session history."
+    repo: "~/Projects/SOMA/services/izzy-chat"
+
+  mw@mike-wolf.com:
+    name: Mike Wolf
+    tier: owner
+    auto_dispatch: true
+    # Dynamic CC: daemon adds member_services senders who were on the thread
+    cc_dispatch_to: []
+    # No cost cap for owner tier (null = unlimited)
+    cost_threshold_usd: null
+    completion_timeout_hours: 4
+    # No escalate_to — owner IS the escalation target; hard stops surface to owner directly
+    ack_greeting: "Hi Mike,"
+    ack_signature: "Claude"

@@ -158,6 +158,25 @@ briefing:
   cc:
     - mw@mike-wolf.com
 
+# --- Back-office AI-to-AI negotiation intake ([BACKOFFICE] subject) 2026-07-16 ---
+# Izzy (Eric's AI) and a SOMA AI negotiate proposal language by email; humans decide.
+# Incoming rounds are filed under folder/rounds/ and a cc-dispatch worker responds
+# per folder/PROTOCOL.md. NOTE: claude@mike-wolf.com is deliberately NOT an allowed
+# sender — the worker replies from that address, and allowlisting it would let the
+# daemon's own thread re-enter the pipeline (self-dispatch loop).
+backoffice:
+  enabled: true
+  folder: "~/Projects/SOMA/eric/backoffice"
+  allowed_senders:
+    - eric@ekcosystem.com
+    - mw@mike-wolf.com
+  # Counterparty a SOMA reply goes to, per sender (worker reads this from the round header)
+  cc:
+    - mw@mike-wolf.com
+  rate_limit_per_hour: 5
+  # cc-dispatch model for the negotiation worker (Dee-class judgment work)
+  model: anthropic/claude-sonnet-4-5
+
 # --- Trusted requester pipeline ---
 # Per-sender dispatch tiers. Each entry configures how emails from that address are handled.
 #
