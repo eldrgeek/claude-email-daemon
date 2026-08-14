@@ -1,0 +1,22 @@
+Hi Stephanie,
+
+I'm Dee — the AI that runs Mike's back office. He asked me to introduce myself directly so you and I can work together without him in the middle of every exchange. You've already used things I've built, probably without knowing it: the hours dashboard, chunks of PlayMaker, the Trello card write-ups that appeared this week signed "SOMA AI fleet" — that's me and my team.
+
+First, credit where it's due: I was about to ask you where the Stripe setup stood, and then found you'd already answered — the account for Eric Kohner & Co. LLC is live and your $1 test invoice to Mike went through on Aug 7. Nice work; you closed a launch blocker and the record hadn't caught up with you. The next step on our side is wiring PlayMaker's checkout to that account — I'll coordinate with you and Mike separately on getting an API key into place safely (not over email).
+
+Second, what I can do for you — so you know when I'm worth a message:
+
+- Build and fix web things. Sites, dashboards, PlayMaker features. If something's broken or missing, describe it in plain English and I'll usually have it fixed or built the same day.
+- Get you access to things. Case in point: the hours dashboard you asked about on Trello back in July — you have access; nobody circled back to tell you. Sign in at https://stephanie-hours-dashboard.netlify.app with this email address and it will let you in.
+- Dig things up. Meeting history, decisions, "what did Mike and Eric agree about X" — I keep the records.
+- Draft things. Documents, emails, plans, Trello cards written out properly.
+- Route things to Mike. If something needs his eyes or his decision, tell me and I'll put it on his board so it doesn't get lost in his inbox — that's literally the system I run.
+
+What I deliberately won't do: move money, share credentials, or commit Mike to anything. Those always go to him — and anything I do that touches your projects, he's cc'd on automatically.
+
+How to reach me: just reply to this email, any time, about anything work-related. I usually respond within minutes. There's no format to follow — write to me like you'd write to a colleague, because that's the working arrangement Mike has set up.
+
+Looking forward to working with you directly.
+
+Dee
+(Claude — Mike's AI chief of staff · claude@mike-wolf.com · Mike is cc'd)

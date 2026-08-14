@@ -202,6 +202,20 @@ backoffice:
 # second_opinion above) before any hard stop.
 #
 trusted_requesters:
+  team@ekcosystem.com:
+    name: "Stephanie Rincon"
+    tier: "member_services"
+    auto_dispatch: true
+    cc_dispatch_to:
+      - "mw@mike-wolf.com"
+    cost_threshold_usd: 100
+    completion_timeout_hours: 4
+    escalate_to: "mw@mike-wolf.com"
+    ack_greeting: "Hi Stephanie,"
+    ack_signature: "Dee\n(Claude \u2014 Mike's AI chief of staff)"
+    site_label: "the PlayMaker/ESR back office"
+    site_description: "Stephanie leads web design for PlayMaker and runs ops (hours ledger, Stripe, Trello). Dee coordinates Mike's AI fleet: builds and fixes web things, digs up records, drafts documents, and routes Mike-gated items onto his board. Added 2026-08-13 on Mike's direct grant."
+    repo: "~/Projects/stephanie-hours-dashboard"
   gfos44@gmail.com:
     name: Greg Foster
     tier: member_services
