@@ -1838,7 +1838,7 @@ def _format_attachments_section(attachments, per_file_chars=6000):
 
 def fetch_new_emails(imap_server, address, password, state, source="inbox"):
     """Fetch unprocessed emails from an IMAP mailbox."""
-    mail = imaplib.IMAP4_SSL(imap_server)
+    mail = imaplib.IMAP4_SSL(imap_server, timeout=30)
     mail.login(address, password)
     mail.select("inbox")
 
@@ -1898,7 +1898,7 @@ def fetch_new_emails(imap_server, address, password, state, source="inbox"):
 
 def fetch_claude_drafts(imap_server, address, password, draft_prefix, state):
     """Fetch drafts from Mike's Gmail that match the Claude prefix."""
-    mail = imaplib.IMAP4_SSL(imap_server)
+    mail = imaplib.IMAP4_SSL(imap_server, timeout=30)
     mail.login(address, password)
     mail.select("[Gmail]/Drafts")
 
