@@ -446,6 +446,97 @@ def handle_dispatch_email(email_data, config, logger):
 
 
 # ---------------------------------------------------------------------------
+# Card status watchers — R2b stateful cards (handshake-protocol-v1.md §R2b)
+# ---------------------------------------------------------------------------
+# A stateful Pulse action card watches its own precondition ("waiting for
+# email" -> "email received") and updates itself. This is the ONE feasible
+# trigger wired 2026-08-15: an incoming email matching a config rule flips
+# one card's payload.status_line via _estate/bin/pulse-card-status.
+#
+# Deliberately config-driven (config.yaml's card_status_watchers.rules), NOT
+# a hardcoded dict like PROVIDER_EXPORTS above — a rule can only ever flip
+# one card's status_line text, so a loose match's blast radius is "a card
+# says the wrong thing," never "the daemon executed/downloaded something."
+# That's a materially smaller risk than provider-export ingestion, so it
+# doesn't need the same hardcoded-allowlist ceremony.
+#
+# Honest limit (see config.yaml's own comment on the stripe-teammate-invite
+# rule): this only ever sees mail that reaches claude@'s INBOX (this loop) or
+# mikeai@'s DRAFTS (the other poll below) — it cannot watch mw@mike-wolf.com
+# directly. A rule that needs to react to mail Stripe/etc. send straight to
+# mw@ only fires if that mail is also cc'd/forwarded to claude@, or once
+# mikeai@'s draft-polling (currently broken — stale app password, Mike-gated)
+# is restored. State this plainly rather than claiming coverage the daemon
+# doesn't have.
+
+def _match_card_status_watcher(email_data, config):
+    """Return the first matching rule dict from config['card_status_watchers']
+    ['rules'] for this email, else None. Each rule needs from_contains and/or
+    subject_contains (substring, case-insensitive) plus card_key + status_line
+    — a rule missing either of the latter two is skipped rather than firing
+    with a blank/broken write."""
+    csw_cfg = config.get("card_status_watchers", {}) or {}
+    if not csw_cfg.get("enabled", False):
+        return None
+    sender_raw = email_data.get("from", "") or ""
+    m = re.search(r"<([^>]+)>", sender_raw)
+    sender = (m.group(1) if m else sender_raw).strip().lower()
+    subject = (email_data.get("subject", "") or "").lower()
+    for rule in csw_cfg.get("rules", []) or []:
+        if not rule.get("card_key") or not rule.get("status_line"):
+            continue
+        from_contains = (rule.get("from_contains") or "").lower()
+        subject_contains = (rule.get("subject_contains") or "").lower()
+        if from_contains and from_contains not in sender:
+            continue
+        if subject_contains and subject_contains not in subject:
+            continue
+        if not from_contains and not subject_contains:
+            continue  # a rule with neither filter would match every email — refuse it
+        return rule
+    return None
+
+
+def handle_card_status_watcher_email(email_data, config, logger, rule):
+    """Flip one Pulse card's payload.status_line via
+    _estate/bin/pulse-card-status. Never replies, forwards, or touches the
+    card's `status` column (open/answered/...) — that stays R3a/board-owned.
+    Shells out rather than importing pulse_common directly so this daemon
+    doesn't need pulse-zero on its sys.path to start up; a missing/moved
+    checkout shows up as one failed subprocess call, logged, not a daemon
+    crash."""
+    script = os.path.expanduser("~/Projects/_estate/bin/pulse-card-status")
+    result = {
+        "action": "card_status_watcher",
+        "rule": rule.get("name"),
+        "card_key": rule.get("card_key"),
+        "subject": email_data.get("subject", ""),
+        "from": email_data.get("from", ""),
+    }
+    try:
+        proc = subprocess.run(
+            [script, "--key", rule["card_key"], "--status-line", rule["status_line"],
+             "--source", "claude-email-daemon"],
+            capture_output=True, text=True, timeout=30,
+        )
+        result["returncode"] = proc.returncode
+        result["stdout"] = proc.stdout.strip()[:500]
+        result["stderr"] = proc.stderr.strip()[:500]
+        if proc.returncode != 0:
+            logging.error(
+                f"card_status_watcher rule={rule.get('name')} failed (exit "
+                f"{proc.returncode}): {proc.stderr.strip()[:300]}"
+            )
+        else:
+            logging.info(f"card_status_watcher rule={rule.get('name')} flipped card_key={rule.get('card_key')}")
+    except Exception as e:
+        result["error"] = str(e)
+        logging.error(f"card_status_watcher rule={rule.get('name')} exception: {e}")
+    logger.log(result)
+    return result
+
+
+# ---------------------------------------------------------------------------
 # Board routing — [BOARD] subject pattern
 # ---------------------------------------------------------------------------
 # Cross-surface intake into the SOMA board (~/Projects/SOMA/board/inbox/).
@@ -3860,6 +3951,24 @@ def run_cycle(config, state, logger, dry_run=False):
                     results.append({"action": "export_ingest_dry_run", "subject": em["subject"]})
                 state.mark_processed("inbox", em["stable_id"])
                 continue
+
+            # Card status watchers (R2b): flip one Pulse card's status_line and
+            # move on — never a reason to forward/reply/dispatch this email,
+            # so it short-circuits before dispatch/board/general routing too.
+            # Does NOT mark_processed+continue on its own the way the others
+            # do below it in this list — a real invite/notification email may
+            # ALSO be worth routing normally (e.g. an actual [DISPATCH] or a
+            # forward-worthy notice), so this only side-effects and falls
+            # through to the checks below rather than swallowing the email.
+            _csw_rule = _match_card_status_watcher(em, config)
+            if _csw_rule is not None:
+                if not dry_run:
+                    csw_result = handle_card_status_watcher_email(em, config, logger, _csw_rule)
+                    results.append(csw_result or {})
+                    logging.info(f"  [card-status-watcher/{_csw_rule.get('name')}] {em['subject'][:60]}")
+                else:
+                    logging.info(f"  [card-status-watcher/dry-run/{_csw_rule.get('name')}] {em['subject'][:60]}")
+                    results.append({"action": "card_status_watcher_dry_run", "subject": em["subject"]})
 
             # Dispatch emails short-circuit LLM routing entirely
             if DISPATCH_SUBJECT_RE.match(em.get('subject', '')):

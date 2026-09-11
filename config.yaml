@@ -158,6 +158,40 @@ briefing:
   cc:
     - mw@mike-wolf.com
 
+# --- Card status watchers (R2b stateful Pulse cards) 2026-08-15 ---
+# handshake-protocol-v1.md §R2b: "the board is a console, not a message
+# board." A stateful action card watches its own precondition and updates
+# itself. Each rule below matches an incoming email (substring, case-
+# insensitive, against From: and/or Subject:) and flips ONE Pulse card's
+# payload.status_line via ~/Projects/_estate/bin/pulse-card-status — never
+# the card's `status` column, never a reply/forward on its own (matching
+# emails still fall through to normal routing below, since a real notice
+# like this may also be worth Mike seeing directly).
+#
+# A rule needs at least one of from_contains/subject_contains (a rule with
+# neither is refused rather than matching every email) and both card_key
+# (the Pulse card's dedupe_key) and status_line (the exact new text).
+card_status_watchers:
+  enabled: true
+  rules:
+    - name: stripe-teammate-invite
+      from_contains: "stripe.com"
+      subject_contains: "invitation"
+      card_key: stripe-teammate-key-mint
+      status_line: "📬 Email received — click Accept + create the key"
+      # HONESTY NOTE (2026-08-15, do not remove): Stripe's own invite email
+      # goes to mw@mike-wolf.com, which this daemon does NOT poll — only
+      # claude@'s inbox (this loop) and mikeai@'s drafts (a separate poll)
+      # are watched, and mikeai@ draft-polling is currently BROKEN (stale
+      # app password, Mike-gated; see claude-email-daemon/CLAUDE.md and
+      # SOMA/state/email-daemon-auth-alert.json). This rule only fires if
+      # Stephanie also cc's claude@mike-wolf.com on the invite (asked when
+      # the invite was requested 2026-08-14, unconfirmed she will) — or once
+      # the mikeai@ app password is regenerated and draft-polling covers
+      # mw@ too. Until then, the card's own status_line source note tells
+      # Mike this gap plainly: if the card still says "waiting" but the
+      # invite is actually in his inbox, its buttons work anyway.
+
 # --- Back-office AI-to-AI negotiation intake ([BACKOFFICE] subject) 2026-07-16 ---
 # Izzy (Eric's AI) and a SOMA AI negotiate proposal language by email; humans decide.
 # Incoming rounds are filed under folder/rounds/ and a cc-dispatch worker responds
