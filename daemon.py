@@ -2943,6 +2943,19 @@ def handle_trusted_email(email_data, config, logger):
         return _escalate("DKIM/SPF authentication failed — possible spoofed sender")
 
     # ----------------------------------------------------------------
+    # Threads that are a conversation, not a work request: a subject matching
+    # the requester's escalate_subject_patterns goes to escalate_to and never to
+    # the site worker. Added 2026-10-12 after Eric's 09-30 reply on our Codex
+    # setup thread was dispatched to the izzy-chat worker, which had no context
+    # and told him our own setup email looked like social engineering.
+    # ----------------------------------------------------------------
+    subject_text = email_data.get("subject", "") or ""
+    for pattern in requester.get("escalate_subject_patterns", []) or []:
+        if re.search(pattern, subject_text, re.IGNORECASE):
+            return _escalate(f"subject matches escalate_subject_patterns ({pattern}) — "
+                             "a conversation thread, not a site request")
+
+    # ----------------------------------------------------------------
     # Classify the email
     # ----------------------------------------------------------------
     classification = classify_trusted_email(config, email_data, requester)

@@ -282,6 +282,13 @@ trusted_requesters:
     site_label: "the Witness Projection / Izzy site"
     site_description: "Izzy is the AI dramaturge and life coach collaborator for Eric's play Witness Projection — an AI chat interface with RAG knowledge retrieval, TTS voice, working document, and session history."
     repo: "~/Projects/SOMA/services/izzy-chat"
+    # Conversation threads with Eric go to Mike, never to the izzy-chat worker (2026-10-12).
+    escalate_subject_patterns:
+      - "Izzy"
+      - "Codex"
+      - "Seed Door"
+      - "Two Universes"
+      - "room link"
 
   # Mark Kinski (Discord @Inarai) — first data_requester. Emails information /
   # analysis requests; results are auto-served back by email (CC Mike). A request
