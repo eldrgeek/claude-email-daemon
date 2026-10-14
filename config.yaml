@@ -308,6 +308,34 @@ trusted_requesters:
     ack_greeting: "Hi Mark,"
     ack_signature: "Claude\n(assistant for Mike Wolf)"
 
+  # Harold Miller — owns the DGX Spark he is sharing with Mike's team (spark-gate,
+  # 2026-10-14 Zoom with Harold + George Graves). Mike's grant, 2026-10-14: Harold may
+  # ask claude@ any questions about networking, AI and the Spark project, and get
+  # answers back by email. Same data_requester tier as Mark: answers only, no repo,
+  # no deploy; key/password/access requests hard-stop; Mike is CC'd on every reply.
+  harold.p@miller.org:
+    name: Harold
+    tier: data_requester
+    auto_dispatch: true
+    cc_dispatch_to:
+      - mw@mike-wolf.com
+    cost_threshold_usd: 100
+    completion_timeout_hours: 4
+    escalate_to: mw@mike-wolf.com
+    ack_greeting: "Hi Harold,"
+    ack_signature: "Claude\n(assistant for Mike Wolf)"
+  majorpeabody@gmail.com:
+    name: Harold
+    tier: data_requester
+    auto_dispatch: true
+    cc_dispatch_to:
+      - mw@mike-wolf.com
+    cost_threshold_usd: 100
+    completion_timeout_hours: 4
+    escalate_to: mw@mike-wolf.com
+    ack_greeting: "Hi Harold,"
+    ack_signature: "Claude\n(assistant for Mike Wolf)"
+
   mw@mike-wolf.com:
     name: Mike Wolf
     tier: owner
