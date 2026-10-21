@@ -2112,8 +2112,35 @@ def _check_dkim_spf(email_data):
     return None
 
 
-def _parse_classify_json(raw):
-    """Extract and parse JSON from a classifier response string."""
+def _has_category(d):
+    return "category" in d
+
+
+def _headless_helpers():
+    """(HEADLESS_GUARD, first_json) from the estate's shared wrapper, ~/Projects/SOMA/tools/claude_cli.py
+    (bead es-8a1). Imported lazily and by path, the way accord-chat does, so a missing SOMA checkout
+    degrades to the old behaviour (no guard, the old parser) instead of stopping the email front door."""
+    try:
+        tools = os.environ.get("SOMA_TOOLS_DIR") or str(Path.home() / "Projects/SOMA/tools")
+        if tools not in sys.path:
+            sys.path.insert(0, tools)
+        from claude_cli import HEADLESS_GUARD, first_json
+        return HEADLESS_GUARD, first_json
+    except Exception:
+        return None, None
+
+
+def _parse_classify_json(raw, accept=None):
+    """Extract and parse JSON from a classifier response string.
+
+    The first JSON object in the reply that `accept` approves wins (bead es-8a1): a managed SessionStart hook adds a
+    "register your tools" note to every `claude -p` run, and a model that answers it puts a note
+    or a stray object before the real JSON. Falls back to the original fence / first-brace parse."""
+    _, first_json = _headless_helpers()
+    if first_json is not None:
+        obj = first_json(raw or "", lambda v: isinstance(v, dict) and (accept is None or accept(v)))
+        if obj is not None:
+            return obj
     json_str = raw
     if "```" in json_str:
         json_str = json_str.split("```")[1]
@@ -2136,7 +2163,7 @@ def _classify_via_vps_fallback(classify_prompt, email_text):
     )
     resp = requests.post(vps_url, json={"question": question, "context": ""}, timeout=45)
     raw = resp.json().get("answer", "").strip()
-    result = _parse_classify_json(raw)
+    result = _parse_classify_json(raw, _has_category)
     result["classifier"] = "vps_haiku_fallback"
     return result
 
@@ -2161,7 +2188,7 @@ def classify_trusted_email(config, email_data, requester):
             }
         }, timeout=30)
         raw = resp.json().get("response", "").strip()
-        result = _parse_classify_json(raw)
+        result = _parse_classify_json(raw, _has_category)
         result["classifier"] = "ollama"
         return result
     except Exception as e:
@@ -2203,6 +2230,37 @@ def _resolve_claude_bin():
         if p.exists():
             return str(p)
     return shutil.which("claude") or "claude"
+
+
+def _claude_json_answer(prompt, model, timeout, accept, label):
+    """One `claude -p` call whose reply must hold a JSON object accepted by `accept`.
+
+    Bead es-8a1: appends the shared HEADLESS_GUARD (so the managed SessionStart hook's note is not
+    answered), parses with the tolerant _parse_classify_json, and retries once when the reply holds
+    no accepted object. Returns the parsed dict, or None after logging why."""
+    guard, _ = _headless_helpers()
+    cmd = [_resolve_claude_bin(), "-p", "--output-format", "json", "--model", model]
+    if guard:
+        cmd += ["--append-system-prompt", guard]
+    for attempt in (1, 2):
+        proc = subprocess.run(cmd, input=prompt, capture_output=True, text=True, timeout=timeout)
+        if proc.returncode != 0:
+            logging.warning(f"{label}: claude exited {proc.returncode}: {proc.stderr[:200]}")
+            return None
+        # `claude -p --output-format json` wraps the answer as {"result": "...", ...}
+        try:
+            outer = json.loads(proc.stdout.strip())
+            answer = outer.get("result", proc.stdout) if isinstance(outer, dict) else proc.stdout
+        except json.JSONDecodeError:
+            answer = proc.stdout
+        try:
+            parsed = _parse_classify_json(answer, accept)
+        except (ValueError, IndexError):
+            parsed = None
+        if isinstance(parsed, dict) and accept(parsed):
+            return parsed
+        logging.warning(f"{label}: attempt {attempt} of 2 gave no usable JSON (starts {str(answer)[:120]!r})")
+    return None
 
 
 def _second_opinion(config, email_data, requester, first_pass):
@@ -2258,27 +2316,10 @@ def _second_opinion(config, email_data, requester, first_pass):
     )
     prompt = rubric + "\n\nEmail:\n" + email_text
 
-    claude_bin = _resolve_claude_bin()
     try:
-        proc = subprocess.run(
-            [claude_bin, "-p", "--output-format", "json", "--model", model],
-            input=prompt,
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-        )
-        if proc.returncode != 0:
-            logging.warning(
-                f"second_opinion: claude exited {proc.returncode}: {proc.stderr[:200]}"
-            )
+        refined = _claude_json_answer(prompt, model, timeout, _has_category, "second_opinion")
+        if refined is None:
             return None
-        # `claude -p --output-format json` wraps the answer as {"result": "...", ...}
-        try:
-            outer = json.loads(proc.stdout.strip())
-            answer = outer.get("result", proc.stdout) if isinstance(outer, dict) else proc.stdout
-        except json.JSONDecodeError:
-            answer = proc.stdout
-        refined = _parse_classify_json(answer)
         refined["classifier"] = f"second_opinion:{model}"
         return refined
     except Exception as e:
@@ -2355,27 +2396,10 @@ def decompose_email_tasks(config, email_data, requester, classification):
         '"kind": "build|verify|diagnose", "needs": ["<str>"], "ready": true|false}]}'
     )
 
-    claude_bin = _resolve_claude_bin()
     try:
-        proc = subprocess.run(
-            [claude_bin, "-p", "--output-format", "json", "--model", model],
-            input=rubric,
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-        )
-        if proc.returncode != 0:
-            logging.warning(
-                f"decompose: claude exited {proc.returncode}: {proc.stderr[:200]}"
-            )
+        parsed = _claude_json_answer(rubric, model, timeout, lambda d: isinstance(d.get("tasks"), list), "decompose")
+        if parsed is None:
             return None
-        # `claude -p --output-format json` wraps the answer as {"result": "...", ...}
-        try:
-            outer = json.loads(proc.stdout.strip())
-            answer = outer.get("result", proc.stdout) if isinstance(outer, dict) else proc.stdout
-        except json.JSONDecodeError:
-            answer = proc.stdout
-        parsed = _parse_classify_json(answer)
     except Exception as e:
         logging.warning(f"decompose unavailable ({e}); treating email as a single task")
         return None
