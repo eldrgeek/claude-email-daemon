@@ -750,6 +750,65 @@ def handle_board_email(email_data, config, logger, trusted=False):
 
 
 # ---------------------------------------------------------------------------
+# Plan intake — [PLAN] change / [PLAN] commitment (2026-11-21)
+# ---------------------------------------------------------------------------
+# Mike's nightly-plan system (projects-meta _estate/plans/ASSISTANT-BRIEF.md):
+# any assistant that sees Mike change his plan or make a commitment emails
+# Claude's inbox with subject `[PLAN] change` or `[PLAN] commitment`. This
+# handler only spools the email as JSON for `_estate/bin/plan-coach`, the single
+# writer of plan files, which picks it up on its next 5-minute tick. No LLM
+# call, no shell-out, no reply: replies would land in Mike's own inbox (Dottie
+# and Duet send from his Gmail) and add noise. Same allowlist as dispatch.
+# Built by Claude Opus 5.5 for Mike Wolf (Mike Management, "Build Mac plan coach").
+
+PLAN_SUBJECT_RE = re.compile(r'^\[PLAN\]\s*(.*)', re.IGNORECASE)
+PLAN_SPOOL_DIR = '~/.local/state/plan-coach/inbox'
+
+
+def handle_plan_email(email_data, config, logger, spool_dir=None):
+    """Spool a [PLAN] email for plan-coach. Returns a log dict, or None if the
+    subject doesn't match."""
+    subject = email_data.get('subject', '')
+    m = PLAN_SUBJECT_RE.match(subject)
+    if not m:
+        return None
+    sender_raw = email_data.get('from', '')
+    m_addr = re.search(r'<([^>]+)>', sender_raw)
+    sender_email = (m_addr.group(1) if m_addr else sender_raw).strip().lower()
+    allowed = [s.lower() for s in config.get('dispatch', {}).get('allowed_senders', [])]
+    log = {'type': 'plan', 'from': sender_raw, 'sender_email': sender_email,
+           'subject': subject, 'timestamp': datetime.now().isoformat()}
+    if sender_email not in allowed:
+        log['result'] = 'rejected:sender_not_allowlisted'
+        logging.warning(f"[plan] rejected (sender_not_allowlisted): {sender_email}")
+        return log
+    spool = Path(os.path.expanduser(spool_dir or PLAN_SPOOL_DIR))
+    spool.mkdir(parents=True, exist_ok=True)
+    key = email_data.get('message_id') or email_data.get('stable_id') or subject
+    digest = hashlib.sha256(str(key).encode()).hexdigest()[:12]
+    if any(spool.glob(f"*-{digest}.json")) or any((spool / 'done').glob(f"*-{digest}.json")):
+        log['result'] = 'duplicate'
+        return log
+    path = spool / f"{datetime.now().strftime('%Y%m%dT%H%M%S')}-{digest}.json"
+    tmp = path.with_suffix('.tmp')
+    tmp.write_text(json.dumps({
+        'subject': subject,
+        'kind': m.group(1).strip(),
+        'from': sender_raw,
+        'sender_email': sender_email,
+        'date': email_data.get('date', ''),
+        'message_id': email_data.get('message_id', ''),
+        'body': email_data.get('body', ''),
+        'received_at': datetime.now().astimezone().isoformat(timespec='seconds'),
+    }, ensure_ascii=False, indent=1))
+    tmp.rename(path)
+    log['result'] = 'spooled'
+    log['path'] = str(path)
+    logging.info(f"[plan] spooled {path.name}")
+    return log
+
+
+# ---------------------------------------------------------------------------
 # Briefing intake — [BRIEFING] <persona> subject pattern (2026-07-09)
 # ---------------------------------------------------------------------------
 # Carries an interview briefing from an emailed doc to a soma-zoom-presence
@@ -4028,6 +4087,17 @@ def run_cycle(config, state, logger, dry_run=False):
                 else:
                     logging.info(f"  [board/dry-run] {em['subject'][:60]}")
                     results.append({"action": "board_dry_run", "subject": em["subject"]})
+                state.mark_processed("inbox", em["stable_id"])
+                continue
+
+            # Plan emails ([PLAN] change / commitment) short-circuit LLM routing:
+            # spool for plan-coach, no reply.
+            if PLAN_SUBJECT_RE.match(em.get('subject', '')):
+                if not dry_run:
+                    results.append(handle_plan_email(em, config, logger) or {})
+                    logging.info(f"  [plan] {em['subject'][:60]}")
+                else:
+                    results.append({"action": "plan_dry_run", "subject": em["subject"]})
                 state.mark_processed("inbox", em["stable_id"])
                 continue
 
